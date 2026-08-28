@@ -1,0 +1,95 @@
+# codex-dispatch-plugin
+
+Claude Code plugin：**「Claude 寫、Codex 審」的調度規則**。
+
+- 官方 [codex-plugin-cc](https://github.com/openai/codex-plugin-cc) 負責「怎麼跟 Codex 溝通」。
+- 本 plugin 負責「**何時**呼叫、**失敗**怎麼辦、**額度**怎麼顧、結果怎麼用」——規則寫給 Claude 看，使用者照常下指令，不需背任何 Codex 指令。
+- 單向：Claude Code 呼叫 Codex，Codex 只審不寫（救援也預設唯讀）。
+
+## 它做什麼
+
+| 情境 | 行為 |
+|---|---|
+| 估計改動 >50 行或 >3 檔 | 先寫計畫 → Codex 審計畫 → 採納後才實作 |
+| 實作完成 | Codex 審 diff（結構化 findings）：critical/high 自動修正重審（上限 3 輪、無進展即停）；medium/low 交使用者 |
+| 同一 bug 修 2 次失敗 | 交 Codex 救援（唯讀診斷，Claude 套用建議） |
+| 使用者說「嚴格審查」 | adversarial review 帶 focus |
+| 小改動 | 不送審 |
+| **Codex 失敗／額度用完** | 送審前先查額度（不耗額度）；失敗自動分類（額度／連線／輸出壞掉）；審 diff 失敗→記入未審清單繼續做，審計畫／救援失敗→詢問使用者。**絕不阻塞、絕不無限重試。** 收工前補審或逐項標記「⚠ 未經 Codex 審查」 |
+
+## 前置條件
+
+1. Node.js ≥ 18.18
+2. Codex CLI：`npm install -g @openai/codex`，並在終端機 `codex login`（ChatGPT 帳號，Free 可用但額度小）
+3. 官方 plugin（在 Claude Code 內）：
+   ```
+   /plugin marketplace add openai/codex-plugin-cc
+   /plugin install codex@openai-codex
+   ```
+   **不要**開啟它的 review gate（撞限額會無限迴圈）。
+4. 目標專案是 git repo（本機 `git init` 即可，不需 commit 或 remote；Codex review 靠 git diff 定義「改了什麼」）
+5. **Windows 必做**：`~/.codex/config.toml` 加入
+   ```toml
+   [windows]
+   sandbox = "unelevated"
+   ```
+   否則 Codex 在沙箱裡跑 git 會被 `blocked by policy` 擋住、什麼都審不了。`/codex-dispatch:setup` 會檢查並可代寫。
+
+## 安裝
+
+```bash
+claude plugin marketplace add me7fun/codex-dispatch-plugin
+# 在目標專案根目錄：
+claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
+```
+然後在 Claude Code 內執行 `/codex-dispatch:setup`：檢查上述前置條件、把 5 行規則段接線到專案 `CLAUDE.md`。
+
+## 指令
+
+| 指令 | 用途 |
+|---|---|
+| `/codex-dispatch:setup [--write]` | 前置檢查 + 接線 CLAUDE.md |
+| `/codex-dispatch:status` | Codex 額度（不耗額度）+ 未審清單 |
+| `/codex-dispatch:review [--adversarial\|--native] [--base ref] [--scope s] [focus]` | 手動送審目前改動 |
+
+平常不需要打指令——SessionStart hook 會注入規則摘要，Claude 依 Skill `codex-dispatch:dispatch` 自動調度。
+
+## 設定（可省略）
+
+`<專案>/.claude/codex-dispatch.config.json`：
+```json
+{
+  "quotaThreshold": 95,
+  "lineThreshold": 50,
+  "fileThreshold": 3,
+  "maxRounds": 3,
+  "onCodexUnavailable": "auto",
+  "reviewMode": "adversarial",
+  "planDir": "plans"
+}
+```
+- `onCodexUnavailable`：`auto`（審 diff→繼續、審計畫/救援→詢問）｜`ask`（全部詢問）｜`continue`（全部繼續）
+- `reviewMode`：`adversarial`（結構化 JSON，自動迴圈用）｜`native`（Codex 原生審查，純文字，只呈現不自動修）
+
+## 底層 CLI
+
+所有 Codex 呼叫走 `plugins/codex-dispatch/scripts/dispatch.mjs`（`--json` 回統一結果物件；exit 0 成功、1 Codex 端失敗、2 本地錯誤）：
+`resolve` / `quota` / `preflight` / `review` / `plan-review <file>` / `rescue [--write] <prompt>` / `state` / `snippet`。
+它會從 `~/.claude/plugins/installed_plugins.json` 找官方 plugin 的 `codex-companion.mjs` 直接執行——因為官方 review 類 slash command 設了 `disable-model-invocation`，Claude 自己呼叫不到。
+
+## 資料與安全
+
+- Codex review 會把 **diff 內容**（含未 commit、未追蹤的檔案）送到 OpenAI；plan-review 送計畫全文。
+- CLI 送審前會擋下疑似機密檔（`.env*`、`*.pem/*.key`、`credentials.json`、`auth.json`、`.npmrc`…），回 `local-error`；確認無機密才加 `--allow-secrets`。
+- `plan-review` / `--prompt-file` 只接受專案根目錄內的一般檔案（realpath 比對，擋 symlink 逃逸）。
+- 未審清單**不會自動清除**（超過 24 小時標示 STALE）——「沒審」是義務，只有補審成功或使用者明確決定才解除。
+
+## 已知限制
+
+- 額度查詢用的 `account/rateLimits/read` 是 Codex app-server 的實驗性 API；查不到時狀態為 `unknown`，不擋流程。
+- 官方 plugin 更新可能改變 `codex-companion.mjs` 的介面；本 plugin 只依賴 `review/adversarial-review/task/setup` 四個子指令與 `--json` 輸出。
+- 不做：review gate、cloud task、fast mode、自動等待額度重置（改用未審清單 + 下次 session 接手）。
+
+## 開發
+
+本 repo 用 `plans/` 放計畫、以自身流程 dogfood（計畫先經 Codex 審查再實作）。維護者本機另裝 wiki plugin 做知識庫，相關檔案走 `.git/info/exclude` 不進版控。

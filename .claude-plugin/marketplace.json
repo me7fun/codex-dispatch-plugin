@@ -1,0 +1,16 @@
+{
+  "name": "codex-dispatch-plugin",
+  "owner": {
+    "name": "Mickey"
+  },
+  "metadata": {
+    "description": "Claude 寫、Codex 審：跨模型調度規則（依賴官方 codex-plugin-cc）"
+  },
+  "plugins": [
+    {
+      "name": "codex-dispatch",
+      "source": "./plugins/codex-dispatch",
+      "description": "調度規則：何時送 Codex 審、失敗怎麼辦、額度預檢、未審清單追蹤。官方 codex-plugin-cc 負責溝通，本 plugin 負責調度。"
+    }
+  ]
+}

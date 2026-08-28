@@ -1,0 +1,16 @@
+{
+  "description": "codex-dispatch：SessionStart 注入調度規則摘要（fail-soft，不查額度）",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
