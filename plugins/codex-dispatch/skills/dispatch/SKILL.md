@@ -14,7 +14,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/dispatch.mjs" <子指令> --json ...
 ```
 
 子指令：`preflight`、`quota`、`review`、`plan-review <file>`、`rescue [--write] <prompt>`、`state`、`snippet`。一律前景執行（不要 `run_in_background`），review 通常 30–120 秒。
-設定檔 `<專案>/.claude/codex-dispatch.config.json`（缺檔用預設）：`quotaThreshold=95`、`lineThreshold=50`、`fileThreshold=3`、`maxRounds=3`、`onCodexUnavailable=auto`、`reviewMode=adversarial`、`planDir=plans`。
+設定檔 `<專案>/.claude/codex-dispatch.config.json`（缺檔用預設）：`quotaThreshold=95`、`lineThreshold=50`、`fileThreshold=3`、`maxRounds=3`、`onCodexUnavailable=auto`、`reviewMode=adversarial`、`planDir=plans`、`selfReview=auto`。
 
 ## 分工
 - Claude（我）：規劃、架構、實作、套用修正。
@@ -27,7 +27,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/dispatch.mjs" <子指令> --json ...
 2. 實作完成（尚未 commit）：`review --json`（預設 adversarial 模式，輸出結構化 findings）。
    - 送審範圍是整個 working tree：若 `git status` 顯示有**不是我這次改的**未提交變更，先告知使用者「這些會一起被審」；要只審某段就用 `--base <ref>`／`--scope branch`。
    - CLI 會擋下疑似機密檔（.env、*.pem、credentials.json…），回 `local-error`：請使用者處理（移除／gitignore），不要自行加 `--allow-secrets`。
-   - `critical` / `high`：直接修正，重送 `review`。每輪修完若專案有測試就跑。上限 `maxRounds` 輪——**CLI 會強制**：同一批改動（repo + HEAD + 目標）送審達上限就回 `local-error`（訊息含 maxRounds），此時不要加 `--reset-rounds` 自行續審，交使用者裁決；`verdict=approve` 或 commit 後自動開新一輪。
+   - `critical` / `high`：直接修正，重送 `review`。每輪修完若專案有測試就跑。上限 `maxRounds` 輪——**CLI 會強制**：同一批改動（repo + HEAD + 目標）送審達上限就回 `local-error`（訊息含 maxRounds），此時不要加 `--reset-rounds` 自行續審，交使用者裁決；`verdict=approve` 或 commit 後自動開新一輪（approve 只在沒有其他 session 同時在審時清計數）。
    - **同一 finding（file + title 相同）連續兩輪都出現 → 視為無進展，停止並交使用者裁決。**
    - `medium` / `low`：列出交使用者決定，不自行修改。
    - 到頂仍有 critical/high → 列出交使用者。
@@ -48,17 +48,23 @@ CLI 已內建：送審前查額度（`exhausted` 直接不送）、非額度失�
 
 | 呼叫 | `onCodexUnavailable=auto` 時 | 說明 |
 |---|---|---|
-| 審 diff（review） | **C：繼續** | Codex 輸出不是下一步的原料。`state --add-unreviewed "<改了什麼>" --reason <reason> --error "<error>"`，告知使用者一句，繼續原本工作。 |
-| 審計畫（plan-review）／救援（rescue） | **B：詢問** | Codex 輸出是下一步的原料。寫 `.claude/state/codex-pending.md`（做到哪、卡在哪、reason、resetsAt），AskUserQuestion 三選一：「等你回來再說（停止）」「跳過 Codex 照 C 繼續」「停止」。無法提問的環境退化為 C。 |
+| 審 diff（review） | **C：繼續** | Codex 輸出不是下一步的原料。`selfReview=auto` → 先做一次「Claude 自審」（下節），再 `state --add-unreviewed "<改了什麼>" --reason <reason> --error "<error>" --self-reviewed`；`ask` → AskUserQuestion 問一次要不要自審（無法提問就不自審）；`off` → 直接記入（不加 `--self-reviewed`）。告知使用者一句，繼續原本工作。 |
+| 審計畫（plan-review） | **B：詢問** | Codex 輸出是下一步的原料。寫 `.claude/state/codex-pending.md`（做到哪、卡在哪、reason、resetsAt），AskUserQuestion 四選一：「改由 Claude 自審計畫後繼續（Recommended）」「跳過審查照 C 繼續」「等你回來再說（停止）」「停止」（`selfReview=off` 時拿掉第一個選項）。無法提問的環境退化為 C。 |
+| 救援（rescue） | **B：詢問** | 同上，但第一個選項是「改由 Claude subagent **重新診斷**（不是審 diff）後繼續」——用 self-review.md 的 rescue 變體。無法提問的環境：停止並回報卡住的 bug，不自行猜。 |
 
 `onCodexUnavailable=ask` → 全部 B；`continue` → 全部 C。
+
+### Claude 自審（Codex 不可用時的降級，不是替代）
+- 用 `Agent` 工具開 **Explore**（唯讀）subagent，prompt 用 `${CLAUDE_PLUGIN_ROOT}/prompts/self-review.md` 的對應變體（diff／計畫／rescue；填 `{{TARGET}}`／`{{FOCUS}}`）。subagent 自己跑 git diff、自己讀檔；**不要**把我的摘要或辯解餵給它。subagent 回來後先 `git status --short` 確認 working tree 沒被它動過。
+- 回來的 JSON 照同一套 findings 規則處理（critical/high 修、medium/low 交使用者）。自審不消耗 Codex 輪次，自審自己上限 **2 輪**。
+- 自審過的條目仍在未審清單（`--self-reviewed`），額度恢復後仍建議補審；我不會因為自審過就把它當成已審。
 `reason=local-error` 不是 Codex 問題：告訴使用者修環境（訊息裡有 fix），不記未審清單。
 **絕不**因 Codex 失敗而無限重試、阻塞、或自行猜測 Codex 會說什麼。
 
 ## 收工前（每次任務結束、回覆使用者之前）
 1. `state --list --json`。未審清單為空 → 正常收工。
 2. 非空 → `quota --json`。`available` → 對目前 working tree 跑一次 `review --json` 補審（仍受 maxRounds）。成功後只清除**這次審查確實涵蓋的條目**：條目的 `changedPaths` 仍在目前 working tree 且 `headSha` 相同 → `state --clear --id <id>`；已被 commit 走的條目不算涵蓋，保留並告知使用者。
-3. 仍失敗或額度未恢復 → 最終回覆最上方加醒目標題 **「⚠ 未經 Codex 審查」**，逐項列出：改了什麼、原因（額度用完／連線失敗）、重置時間；建議使用者稍後 `/codex-dispatch:review`。清單**不會自動清除**（超過 24h 標示 STALE），只有補審成功或使用者明確說不審才 `state --clear`。
+3. 仍失敗或額度未恢復 → 最終回覆最上方加醒目標題 **「⚠ 未經 Codex 審查」**（該條目若已自審，標題後加「（已由 Claude 自審）」），逐項列出：改了什麼、原因（額度用完／連線失敗）、重置時間、是否自審；建議使用者稍後 `/codex-dispatch:review`。清單**不會自動清除**（超過 24h 標示 STALE），只有補審成功或使用者明確說不審才 `state --clear`。
 
 ## 使用者體驗
 規則寫給我看，使用者照常下指令（「幫我加 XX」）即可，不需背任何 Codex 指令。我只在需要決策（B 情境、medium/low findings、輪次到頂）時打擾使用者。

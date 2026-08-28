@@ -13,8 +13,8 @@
  *                                 請 Codex 唯讀審計畫檔，要求回 JSON
  *   rescue [--write] [--model m] [--effort e] [--prompt-file f] [--allow-secrets] [prompt...]
  *                                 救援：預設唯讀（診斷＋建議 patch）；--write 才讓 Codex 改碼
- *   state [--list] | --add-unreviewed <desc> [--reason r] [--kind k] [--scope s] [--error msg] | --clear [--id x]
- *                                 未審清單
+ *   state [--list] | --add-unreviewed <desc> [--reason r] [--kind k] [--scope s] [--error msg] [--self-reviewed] | --clear [--id x]
+ *                                 未審清單（--self-reviewed：已由 Claude subagent 自審，仍未經 Codex）
  *   snippet [--write]             印出（或寫入）目標專案 CLAUDE.md 的 codex-dispatch 段
  *   unwire [--yes] [--purge-config] [--purge-state] [--root <dir>]
  *                                 反接線：移除 CLAUDE.md 的 codex-dispatch 段（預設 dry-run）。
@@ -32,7 +32,7 @@ import { projectRoot, gitTopLevel, gitHeadSha, gitChangedPathsForGate, gitDiffPa
 import { resolveCompanion, runCompanion, parseJsonLoose, tailLines } from "./lib/companion.mjs";
 import { readQuota } from "./lib/quota.mjs";
 import { loadConfig, CONFIG_REL, DEFAULTS } from "./lib/config.mjs";
-import { loadState, addUnreviewed, clearUnreviewed, reserveRound, releaseRound, resetRounds, purgeState, stateFile } from "./lib/state.mjs";
+import { loadState, addUnreviewed, clearUnreviewed, reserveRound, releaseRound, resetRounds, resetRoundIfLast, purgeState, stateFile } from "./lib/state.mjs";
 
 const SEVERITIES = ["critical", "high", "medium", "low"];
 const VERDICTS = ["approve", "needs-attention"];
@@ -408,7 +408,8 @@ async function cmdReview(argv) {
   result.round = round;
   result.maxRounds = cfg.maxRounds;
   result.cycleKey = cycleKey;
-  if (result.ok && result.verdict === "approve") resetRounds(root, cycleKey); // 通過即結束此 cycle
+  // approve 結束 cycle：只在沒有其他 session 在我之後佔用時清計數（否則會清掉別人的）；沒 commit 的專案靠這條開新輪
+  if (result.ok && result.verdict === "approve") result.cycleReset = resetRoundIfLast(root, cycleKey, round);
   if (!result.ok && (result.reason === "quota" || result.reason === "local-error")) {
     // Codex 根本沒跑（額度不足／本地錯誤）→ 退回這一輪，額度恢復後不會被 maxRounds 擋住
     releaseRound(root, cycleKey);
@@ -712,7 +713,7 @@ async function cmdPreflight(argv) {
 function cmdState(argv) {
   const { options } = parseArgv(argv, {
     valueOptions: ["cwd", "add-unreviewed", "reason", "kind", "scope", "error", "id"],
-    booleanOptions: ["json", "list", "clear"]
+    booleanOptions: ["json", "list", "clear", "self-reviewed"]
   });
   const root = projectRoot(options.cwd);
   if (options["add-unreviewed"] !== undefined) {
@@ -721,7 +722,8 @@ function cmdState(argv) {
       reason: options.reason || "codex-error",
       kind: options.kind || "review",
       scope: options.scope || "working-tree",
-      error: options.error || null
+      error: options.error || null,
+      selfReviewed: Boolean(options["self-reviewed"])
     });
     return emit({ ok: true, kind: "state", action: "add", entry, file: stateFile(root) }, options.json, (x) => `已記入未審清單 #${x.entry.id}：${x.entry.description}\n`);
   }
@@ -961,7 +963,7 @@ function renderPreflight(r) {
 function renderState(r) {
   const lines = [`未審清單（${r.unreviewed.length} 筆${r.staleCount ? `，其中 ${r.staleCount} 筆超過 24h 未處理` : ""}）：`];
   for (const e of r.unreviewed) {
-    lines.push(`- #${e.id} [${e.kind}/${e.reason}]${e.stale ? " [STALE]" : ""} ${e.description}`);
+    lines.push(`- #${e.id} [${e.kind}/${e.reason}]${e.selfReviewed ? " [自審]" : ""}${e.stale ? " [STALE]" : ""} ${e.description}`);
     lines.push(`    ${e.createdAt}  head=${e.headSha ? e.headSha.slice(0, 8) : "-"}  files=${e.changedPaths?.length ?? 0}${e.quota?.resetsAt ? `  重置 ${e.quota.resetsAt}` : ""}`);
   }
   if (r.unreviewed.length === 0) lines.push("  （空）");

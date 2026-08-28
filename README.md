@@ -15,7 +15,7 @@ Claude Code plugin：**「Claude 寫、Codex 審」的調度規則**。
 | 同一 bug 修 2 次失敗 | 交 Codex 救援（唯讀診斷，Claude 套用建議） |
 | 使用者說「嚴格審查」 | adversarial review 帶 focus |
 | 小改動 | 不送審 |
-| **Codex 失敗／額度用完** | 送審前先查額度（不耗額度）；失敗自動分類（額度／連線／輸出壞掉）；審 diff 失敗→記入未審清單繼續做，審計畫／救援失敗→詢問使用者。**絕不阻塞、絕不無限重試。** 收工前補審或逐項標記「⚠ 未經 Codex 審查」 |
+| **Codex 失敗／額度用完** | 送審前先查額度（不耗額度）；失敗自動分類（額度／連線／輸出壞掉）；審 diff 失敗→**Claude 開獨立 subagent 自審**後記入未審清單繼續做，審計畫／救援失敗→詢問使用者（選項含「改由 Claude 自審」）。**絕不阻塞、絕不無限重試。** 收工前補審或逐項標記「⚠ 未經 Codex 審查（已由 Claude 自審）」 |
 
 ## 前置條件
 
@@ -66,10 +66,12 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
   "maxRounds": 3,
   "onCodexUnavailable": "auto",
   "reviewMode": "adversarial",
-  "planDir": "plans"
+  "planDir": "plans",
+  "selfReview": "auto"
 }
 ```
 - `onCodexUnavailable`：`auto`（審 diff→繼續、審計畫/救援→詢問）｜`ask`（全部詢問）｜`continue`（全部繼續）
+- `selfReview`：Codex 不可用時的降級——`auto`（審 diff 失敗自動由 Claude 唯讀 subagent 自審）｜`ask`（每次先問）｜`off`。自審過的條目仍留在未審清單（標「[自審]」），額度恢復後仍建議補審。prompt 有三個變體（審 diff／審計畫／rescue 重新診斷）在 `prompts/self-review.md`。手動的 `/codex-dispatch:review` 不會自審，它只回報 Codex 結果。
 - `reviewMode`：`adversarial`（結構化 JSON，自動迴圈用）｜`native`（Codex 原生審查，純文字，只呈現不自動修）
 
 ## 底層 CLI

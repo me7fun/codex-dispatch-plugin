@@ -73,11 +73,24 @@ const projects = fs
   .split(/\r?\n/)
   .map((l) => l.trim())
   .filter((l) => l && !l.startsWith("#"));
+const updated = [];
+const skipped = [];
 for (const dir of projects) {
   if (!fs.existsSync(dir)) {
     console.error(`跳過（目錄不存在）: ${dir}`);
+    skipped.push(dir);
     continue;
   }
-  run(`claude plugin update ${PLUGIN} --scope local`, dir);
+  try {
+    run(`claude plugin update ${PLUGIN} --scope local`, dir);
+    updated.push(dir);
+  } catch (err) {
+    console.error(`失敗: ${dir}（${err.message.split("\n")[0]}）`);
+    skipped.push(dir);
+  }
 }
-console.log(`\n完成：v${version} 已更新到 ${projects.length} 個專案。重啟 session（或 /reload-plugins）生效。`);
+console.log(`\nv${version}：成功 ${updated.length} 個專案，跳過/失敗 ${skipped.length} 個。重啟 session（或 /reload-plugins）生效。`);
+if (skipped.length) {
+  console.error(`未更新：\n  ${skipped.join("\n  ")}`);
+  process.exit(1);
+}

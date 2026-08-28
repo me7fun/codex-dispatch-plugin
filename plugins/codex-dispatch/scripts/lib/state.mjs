@@ -110,7 +110,7 @@ export function saveState(root, st) {
   return file;
 }
 
-export function addUnreviewed(root, { kind = "review", description, reason = "codex-error", quota = null, scope = "working-tree", error = null }) {
+export function addUnreviewed(root, { kind = "review", description, reason = "codex-error", quota = null, scope = "working-tree", error = null, selfReviewed = false }) {
   // git 查詢放鎖外，縮短持鎖時間
   const entry = {
     id: crypto.randomBytes(4).toString("hex"),
@@ -119,6 +119,7 @@ export function addUnreviewed(root, { kind = "review", description, reason = "co
     reason,
     error,
     quota,
+    selfReviewed: Boolean(selfReviewed), // 已由 Claude subagent 自審（仍未經 Codex）
     repoRoot: root,
     headSha: gitHeadSha(root),
     scope,
@@ -155,6 +156,21 @@ export function reserveRound(root, key, max) {
     st.rounds[key] = used + 1;
     saveState(root, st);
     return { ok: true, round: used + 1 };
+  });
+}
+
+/**
+ * approve 後結束 cycle——但只在「沒有別的 session 在我之後佔用」時清計數（count === 我的 round）。
+ * 這樣多視窗同時審時不會清掉別人的佔用；沒 commit 的專案也不會累積成終身上限。
+ * 回 true 表示已清。
+ */
+export function resetRoundIfLast(root, key, round) {
+  return withLock(root, () => {
+    const st = loadState(root);
+    if ((st.rounds[key] || 0) !== round) return false;
+    delete st.rounds[key];
+    saveState(root, st);
+    return true;
   });
 }
 

@@ -10,12 +10,14 @@ export const DEFAULTS = Object.freeze({
   maxRounds: 3,
   onCodexUnavailable: "auto", // auto | ask | continue
   reviewMode: "adversarial", // adversarial | native
-  planDir: "plans"
+  planDir: "plans",
+  selfReview: "auto" // auto | ask | off：Codex 不可用時由 Claude subagent 自審
 });
 
 const ENUMS = {
   onCodexUnavailable: ["auto", "ask", "continue"],
-  reviewMode: ["adversarial", "native"]
+  reviewMode: ["adversarial", "native"],
+  selfReview: ["auto", "ask", "off"]
 };
 
 function pickInt(v, def, min = 0) {
@@ -45,7 +47,8 @@ export function loadConfig(root) {
       ? raw.onCodexUnavailable
       : DEFAULTS.onCodexUnavailable,
     reviewMode: ENUMS.reviewMode.includes(raw.reviewMode) ? raw.reviewMode : DEFAULTS.reviewMode,
-    planDir: typeof raw.planDir === "string" && raw.planDir.trim() ? raw.planDir.trim() : DEFAULTS.planDir
+    planDir: typeof raw.planDir === "string" && raw.planDir.trim() ? raw.planDir.trim() : DEFAULTS.planDir,
+    selfReview: ENUMS.selfReview.includes(raw.selfReview) ? raw.selfReview : DEFAULTS.selfReview
   };
   return { config, source, warning };
 }
