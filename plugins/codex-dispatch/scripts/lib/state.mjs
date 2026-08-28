@@ -12,9 +12,20 @@ import { gitHeadSha, gitChangedPaths } from "./paths.mjs";
 export const STATE_REL = path.join(".claude", "state", "codex-dispatch.json");
 const VERSION = 1;
 const STALE_HOURS = 24;
+/** 輪次計數超過這麼久沒動就自動清除（沒有任務會跑一週還在同一批改動上） */
+const ROUNDS_TTL_DAYS = 7;
 
 function empty() {
-  return { version: VERSION, unreviewed: [], rounds: {}, updatedAt: null };
+  return { version: VERSION, unreviewed: [], rounds: {}, roundsAt: {}, updatedAt: null };
+}
+
+function touchRound(st, key) {
+  st.roundsAt[key] = new Date().toISOString();
+}
+
+function dropRound(st, key) {
+  delete st.rounds[key];
+  delete st.roundsAt[key];
 }
 
 export function stateFile(root) {
@@ -34,6 +45,18 @@ export function loadState(root, { staleHours = STALE_HOURS } = {}) {
   }
   if (!Array.isArray(st.unreviewed)) st.unreviewed = [];
   if (!st.rounds || typeof st.rounds !== "object") st.rounds = {};
+  if (!st.roundsAt || typeof st.roundsAt !== "object") st.roundsAt = {};
+  // 輪次計數過期清理：沒時間戳的舊資料視為現在起算
+  const roundsCutoff = Date.now() - ROUNDS_TTL_DAYS * 24 * 3600 * 1000;
+  st.roundsPruned = 0;
+  for (const key of Object.keys(st.rounds)) {
+    if (!st.roundsAt[key]) touchRound(st, key);
+    else if (Date.parse(st.roundsAt[key]) < roundsCutoff) {
+      dropRound(st, key);
+      st.roundsPruned += 1;
+    }
+  }
+  for (const key of Object.keys(st.roundsAt)) if (!(key in st.rounds)) delete st.roundsAt[key];
   const cutoff = Date.now() - staleHours * 3600 * 1000;
   st.unreviewed = st.unreviewed.map((e) => ({ ...e, stale: Date.parse(e.createdAt || 0) < cutoff }));
   st.staleCount = st.unreviewed.filter((e) => e.stale).length;
@@ -102,7 +125,7 @@ export function saveState(root, st) {
   const file = stateFile(root);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
-  const { staleCount, ...rest } = st;
+  const { staleCount, roundsPruned, ...rest } = st;
   rest.unreviewed = rest.unreviewed.map(({ stale, ...e }) => e); // stale 是讀取時計算的，不落地
   const body = `${JSON.stringify({ ...rest, updatedAt: new Date().toISOString() }, null, 2)}\n`;
   fs.writeFileSync(tmp, body, "utf8");
@@ -154,6 +177,7 @@ export function reserveRound(root, key, max) {
     const used = st.rounds[key] || 0;
     if (used >= max) return { ok: false, used };
     st.rounds[key] = used + 1;
+    touchRound(st, key);
     saveState(root, st);
     return { ok: true, round: used + 1 };
   });
@@ -168,7 +192,7 @@ export function resetRoundIfLast(root, key, round) {
   return withLock(root, () => {
     const st = loadState(root);
     if ((st.rounds[key] || 0) !== round) return false;
-    delete st.rounds[key];
+    dropRound(st, key);
     saveState(root, st);
     return true;
   });
@@ -179,7 +203,8 @@ export function releaseRound(root, key) {
   withLock(root, () => {
     const st = loadState(root);
     if (st.rounds[key] > 0) st.rounds[key] -= 1;
-    if (!st.rounds[key]) delete st.rounds[key];
+    if (!st.rounds[key]) dropRound(st, key);
+    else touchRound(st, key);
     saveState(root, st);
   });
 }
@@ -207,6 +232,7 @@ export function bumpRound(root, key) {
   return withLock(root, () => {
     const st = loadState(root);
     st.rounds[key] = (st.rounds[key] || 0) + 1;
+    touchRound(st, key);
     saveState(root, st);
     return st.rounds[key];
   });
@@ -215,8 +241,11 @@ export function bumpRound(root, key) {
 export function resetRounds(root, key = null) {
   withLock(root, () => {
     const st = loadState(root);
-    if (key) delete st.rounds[key];
-    else st.rounds = {};
+    if (key) dropRound(st, key);
+    else {
+      st.rounds = {};
+      st.roundsAt = {};
+    }
     saveState(root, st);
   });
 }
