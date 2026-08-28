@@ -6,6 +6,19 @@ Claude Code plugin：**「Claude 寫、Codex 審」的調度規則**。
 - 本 plugin 負責「**何時**呼叫、**失敗**怎麼辦、**額度**怎麼顧、結果怎麼用」——規則寫給 Claude 看，使用者照常下指令，不需背任何 Codex 指令。
 - 單向：Claude Code 呼叫 Codex，Codex 只審不寫（救援也預設唯讀）。
 
+## 為什麼用它，而不是直接裝官方 plugin 就好
+
+官方 plugin 給你的是幾個 slash command——**要記得打、要自己判斷什麼時候打、失敗了自己處理**。本 plugin 把這些變成規則與護欄：
+
+- **不用背指令**：規則在 SessionStart 注入、細節在 Skill；你照常說「幫我加 XX」，Claude 自己決定要不要先寫計畫、什麼時候送審、審完怎麼修。
+- **Claude 其實叫不到官方指令**：官方 review 類 slash command 設了 `disable-model-invocation`，只能人打。本 plugin 直接呼叫底層 `codex-companion.mjs`，讓「Claude 自動送審」真的成立。
+- **額度看得到、也擋得住**：從 Codex app-server 挖出未公開的 `account/rateLimits/read`，送審前先查（不耗額度）；≥95% 直接不送；失敗後再查一次分辨是額度還是連線。官方 issue #102「plugin 內查不到額度」在這裡不存在。
+- **絕不卡死、絕不無限重試**：官方 review gate 撞限額會無限迴圈燒掉兩邊額度（issue #306）。本 plugin 永不開 gate；Codex 失敗時審 diff→記入未審清單繼續做、審計畫／救援→問你，重試上限 1 次。
+- **Codex 掛了還有第二道**：額度用完時 Claude 開一個獨立的唯讀 subagent 自審（同一套 JSON schema、對抗式 prompt），結果照規則處理，但仍標記「未經 Codex 審查」等額度恢復補審。
+- **護欄寫在程式裡，不靠 Claude 自律**：審查輪次上限（CLI 原子強制、多視窗安全）、疑似機密檔擋送（含 rename 繞過）、未審清單不自動消失（只標 STALE）、反接線先預覽再動手。
+- **只審不寫**：Codex 額度花在最值得的地方——審計畫、審 diff、找根因；連救援都預設唯讀，由 Claude 套用建議。Plus 方案的 5 小時窗口撐得住。
+- **自己審自己長大**：本 repo 從第一行就走這套流程。v0.1 到 v0.1.2 共 10 輪審查（Codex 9 輪 + Claude 自審 1 輪），抓出 20+ 個 HIGH——路徑逃逸、`--retries Infinity`、TOML 寫壞、rename 繞過機密閘門、輪次計數競態、TOCTOU symlink、沒 commit 的專案變終身上限……每一條都在 `plans/` 的審查紀錄裡。
+
 ## 它做什麼
 
 | 情境 | 行為 |
@@ -77,7 +90,7 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 ## 底層 CLI
 
 所有 Codex 呼叫走 `plugins/codex-dispatch/scripts/dispatch.mjs`（`--json` 回統一結果物件；exit 0 成功、1 Codex 端失敗、2 本地錯誤）：
-`resolve` / `quota` / `preflight` / `review` / `plan-review <file>` / `rescue [--write] <prompt>` / `state` / `snippet`。
+`resolve` / `quota` / `preflight` / `review` / `plan-review <file>` / `rescue [--write] <prompt>` / `state` / `snippet` / `unwire`。
 它會從 `~/.claude/plugins/installed_plugins.json` 找官方 plugin 的 `codex-companion.mjs` 直接執行——因為官方 review 類 slash command 設了 `disable-model-invocation`，Claude 自己呼叫不到。
 
 ## 資料與安全
@@ -86,6 +99,7 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 - CLI 送審前會擋下疑似機密檔（`.env*`、`*.pem/*.key`、`credentials.json`、`auth.json`、`.npmrc`…），回 `local-error`；確認無機密才加 `--allow-secrets`。
 - `plan-review` / `--prompt-file` 只接受專案根目錄內的一般檔案（realpath 比對，擋 symlink 逃逸）。
 - 未審清單**不會自動清除**（超過 24 小時標示 STALE）——「沒審」是義務，只有補審成功或使用者明確決定才解除。
+- 審查輪次計數（同一批未 commit 改動最多 `maxRounds` 輪）：approve 或 commit 開新一輪；7 天沒動自動清除。多個 Claude 視窗同時審同一專案是安全的（跨程序鎖 + 原子佔用）。
 
 ## 已知限制
 
