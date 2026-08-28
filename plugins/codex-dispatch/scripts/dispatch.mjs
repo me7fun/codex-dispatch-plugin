@@ -717,6 +717,9 @@ function cmdState(argv) {
   });
   const root = projectRoot(options.cwd);
   if (options["add-unreviewed"] !== undefined) {
+    if (!options["add-unreviewed"] || options["add-unreviewed"].startsWith("--")) {
+      return emit(localError("state", `--add-unreviewed 後面要接描述文字（收到「${options["add-unreviewed"] || ""}」）；旗標請放在描述之後`), options.json, (x) => `✗ ${x.error}\n`);
+    }
     const entry = addUnreviewed(root, {
       description: options["add-unreviewed"],
       reason: options.reason || "codex-error",
