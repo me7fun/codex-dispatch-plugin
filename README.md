@@ -51,6 +51,7 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 | `/codex-dispatch:setup [--write]` | 前置檢查 + 接線 CLAUDE.md |
 | `/codex-dispatch:status` | Codex 額度（不耗額度）+ 未審清單 |
 | `/codex-dispatch:review [--adversarial\|--native] [--base ref] [--scope s] [focus]` | 手動送審目前改動 |
+| `/codex-dispatch:uninstall [--purge-config] [--purge-state]` | 反接線：移除 CLAUDE.md 段（預設只預覽、再確認），可選一併 `claude plugin uninstall` |
 
 平常不需要打指令——SessionStart hook 會注入規則摘要，Claude 依 Skill `codex-dispatch:dispatch` 自動調度。
 
@@ -90,6 +91,17 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 - 官方 plugin 更新可能改變 `codex-companion.mjs` 的介面；本 plugin 只依賴 `review/adversarial-review/task/setup` 四個子指令與 `--json` 輸出。
 - 不做：review gate、cloud task、fast mode、自動等待額度重置（改用未審清單 + 下次 session 接手）。
 
+## 反安裝
+
+```
+/codex-dispatch:uninstall
+```
+只移除 setup 寫進 `CLAUDE.md` 的標記段（先預覽、再確認）。`.claude/codex-dispatch.config.json`（你的設定）與 `.claude/state/`（未審清單）預設保留，要清才加 `--purge-config` / `--purge-state`；`plans/` 永不碰。plugin 本體由指令最後詢問是否執行 `claude plugin uninstall codex-dispatch@codex-dispatch-plugin --scope local`。
+
+底層：`node <plugin>/scripts/dispatch.mjs unwire [--yes] [--purge-config] [--purge-state] [--root <dir>]`。
+
 ## 開發
 
 本 repo 用 `plans/` 放計畫、以自身流程 dogfood（計畫先經 Codex 審查再實作）。維護者本機另裝 wiki plugin 做知識庫，相關檔案走 `.git/info/exclude` 不進版控。
+
+**改完怎麼更新到各專案**：安裝本質是「複製到版本化快取」，改原始碼不會自動生效。維護者本機把 marketplace 註冊為目錄（`claude plugin marketplace add <本機路徑>`），改完跑 `node update.js`（bump patch → marketplace update → 對 `projects.local.txt` 列的專案跑 `claude plugin update`）。從 GitHub 安裝的使用者則是 `claude plugin marketplace update codex-dispatch-plugin` + `claude plugin update codex-dispatch@codex-dispatch-plugin --scope local`（需先 push）。

@@ -16,6 +16,10 @@
  *   state [--list] | --add-unreviewed <desc> [--reason r] [--kind k] [--scope s] [--error msg] | --clear [--id x]
  *                                 未審清單
  *   snippet [--write]             印出（或寫入）目標專案 CLAUDE.md 的 codex-dispatch 段
+ *   unwire [--yes] [--purge-config] [--purge-state] [--root <dir>]
+ *                                 反接線：移除 CLAUDE.md 的 codex-dispatch 段（預設 dry-run）。
+ *                                 config / state 是使用者設定與工作流狀態，預設保留，要加旗標才刪；永不碰 plans/。
+ *                                 plugin 本體另外用 claude plugin uninstall。
  *
  * exit code：0 成功；1 Codex 端失敗（quota / codex-error / invalid-output）；2 本地錯誤（local-error）
  */
@@ -28,7 +32,7 @@ import { projectRoot, gitTopLevel, gitHeadSha, gitChangedPathsForGate, gitDiffPa
 import { resolveCompanion, runCompanion, parseJsonLoose, tailLines } from "./lib/companion.mjs";
 import { readQuota } from "./lib/quota.mjs";
 import { loadConfig, CONFIG_REL, DEFAULTS } from "./lib/config.mjs";
-import { loadState, addUnreviewed, clearUnreviewed, reserveRound, releaseRound, resetRounds, stateFile } from "./lib/state.mjs";
+import { loadState, addUnreviewed, clearUnreviewed, reserveRound, releaseRound, resetRounds, purgeState, stateFile } from "./lib/state.mjs";
 
 const SEVERITIES = ["critical", "high", "medium", "low"];
 const VERDICTS = ["approve", "needs-attention"];
@@ -767,6 +771,150 @@ function cmdSnippet(argv) {
   emit({ ok: true, kind: "snippet", file, present: true, updated: has, snippet }, options.json, (x) => `${x.updated ? "已更新" : "已寫入"} ${x.file}\n`);
 }
 
+// ---------- unwire（反接線） ----------
+/** 找 CLAUDE.md 的標記段：必須恰好各一、start 在前。回 {start,end} 行索引或 {error}。 */
+function locateSnippet(lines) {
+  const starts = lines.map((l, i) => (l.trim() === SNIPPET_START ? i : -1)).filter((i) => i >= 0);
+  const ends = lines.map((l, i) => (l.trim() === SNIPPET_END ? i : -1)).filter((i) => i >= 0);
+  if (starts.length === 0 && ends.length === 0) return { absent: true };
+  if (starts.length !== 1 || ends.length !== 1) return { error: `標記數量不對（start ${starts.length}、end ${ends.length}），需各恰好一個；請手動整理後再跑` };
+  if (starts[0] > ends[0]) return { error: "標記順序相反（end 在 start 前）；請手動整理後再跑" };
+  return { start: starts[0], end: ends[0] };
+}
+
+/**
+ * 路徑安全：root 到 file 的每一層都不能是 symlink，且 realpath 必須留在 root 內。
+ * 不存在的層級視為安全（尚未建立）。回 null 表示安全，否則回錯誤訊息。
+ */
+function unsafePath(root, file) {
+  const rel = path.relative(root, file);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return `${file} 不在專案根 ${root} 內`;
+  let cur = root;
+  for (const seg of rel.split(path.sep)) {
+    cur = path.join(cur, seg);
+    try {
+      if (fs.lstatSync(cur).isSymbolicLink()) return `${cur} 是 symlink，拒絕處理`;
+    } catch {
+      return null; // 這層不存在 → 之後也不存在
+    }
+  }
+  return fs.existsSync(file) && !insideRoot(root, file) ? `${file} 解析後不在專案根內` : null;
+}
+
+function cmdUnwire(argv) {
+  const { options } = parseArgv(argv, { valueOptions: ["root", "cwd"], booleanOptions: ["json", "yes", "purge-config", "purge-state"] });
+  const root = options.root ? path.resolve(options.root) : projectRoot(options.cwd);
+  const dryRun = !options.yes;
+  const actions = [];
+  const warnings = [];
+  const fail = (error) => emit(localError("unwire", error, { dryRun, actions, warnings }), options.json, renderUnwire);
+  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) return fail(`專案根不存在：${root}`);
+
+  // ===== 階段 1：只規劃，不動任何檔案 =====
+  const claudeMd = path.join(root, "CLAUDE.md");
+  const cfgFile = path.join(root, CONFIG_REL);
+  const stFile = stateFile(root);
+  const pendingFile = path.join(path.dirname(stFile), "codex-pending.md");
+  for (const f of [claudeMd, cfgFile, stFile, pendingFile]) {
+    const err = unsafePath(root, f);
+    if (err) return fail(err);
+  }
+
+  let claudePlan = null; // {mode:"delete"|"modify", remaining, loc}
+  if (fs.existsSync(claudeMd)) {
+    const lines = fs.readFileSync(claudeMd, "utf8").split(/\r?\n/);
+    const loc = locateSnippet(lines);
+    if (loc.error) return fail(`${claudeMd}：${loc.error}`);
+    if (!loc.absent) {
+      const rest = [...lines.slice(0, loc.start), ...lines.slice(loc.end + 1)];
+      while (rest.length && rest[rest.length - 1].trim() === "") rest.pop();
+      const remaining = rest.join("\n");
+      claudePlan = remaining.trim() === "" ? { mode: "delete", loc } : { mode: "modify", loc, remaining, kept: rest.length };
+    }
+  }
+
+  const purgeConfig = options["purge-config"] && fs.existsSync(cfgFile);
+  if (fs.existsSync(cfgFile) && !purgeConfig) warnings.push(`保留使用者設定 ${cfgFile}（要刪加 --purge-config）`);
+
+  const statePaths = [stFile, pendingFile].filter((p) => fs.existsSync(p));
+  const purgeStateWanted = options["purge-state"] && statePaths.length > 0;
+  if (statePaths.length) {
+    const st = loadState(root);
+    if (st.unreviewed.length) {
+      warnings.push(`⚠ 未審清單仍有 ${st.unreviewed.length} 筆（${st.unreviewed.map((e) => `#${e.id} ${e.description}`).join("；")}）`);
+    }
+    if (!purgeStateWanted) warnings.push(`保留工作流狀態 ${stFile}（要刪加 --purge-state；請先關閉其他 Claude session）`);
+  }
+
+  // 規劃清單（執行順序：state → config → CLAUDE.md；最可能失敗的鎖操作放最前，失敗時什麼都還沒動）
+  if (purgeStateWanted) for (const p of statePaths) actions.push({ file: p, action: "delete", detail: "--purge-state（在 state 鎖內刪除）" });
+  if (purgeConfig) actions.push({ file: cfgFile, action: "delete", detail: "--purge-config" });
+  if (claudePlan?.mode === "delete") actions.push({ file: claudeMd, action: "delete", detail: `刪除標記段（第 ${claudePlan.loc.start + 1}–${claudePlan.loc.end + 1} 行）後整檔為空，刪除檔案` });
+  if (claudePlan?.mode === "modify") actions.push({ file: claudeMd, action: "modify", detail: `刪除標記段第 ${claudePlan.loc.start + 1}–${claudePlan.loc.end + 1} 行，其餘 ${claudePlan.kept} 行保留` });
+
+  // ===== 階段 2：執行（每一步前重新驗證路徑，防檢查後被換成 symlink；任一步失敗回報已完成/未完成）=====
+  if (!dryRun) {
+    const mark = (file, status) => {
+      const a = actions.find((x) => x.file === file && !x.status);
+      if (a) a.status = status;
+    };
+    const guard = (file) => {
+      const err = unsafePath(root, file);
+      if (err) throw new Error(err);
+    };
+    try {
+      if (purgeStateWanted) {
+        for (const p of statePaths) guard(p);
+        purgeState(root); // 拿不到鎖會拋錯 → 此時尚未動任何檔案
+        for (const p of statePaths) mark(p, "done");
+      }
+      if (purgeConfig) {
+        guard(cfgFile);
+        fs.unlinkSync(cfgFile);
+        mark(cfgFile, "done");
+      }
+      if (claudePlan?.mode === "delete") {
+        guard(claudeMd);
+        fs.unlinkSync(claudeMd); // unlink 不跟隨 symlink
+        mark(claudeMd, "done");
+      }
+      if (claudePlan?.mode === "modify") {
+        guard(claudeMd);
+        // 寫暫存檔再 rename：rename 取代的是目標本身，不會跟隨 symlink 寫到別處
+        const tmp = `${claudeMd}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+        fs.writeFileSync(tmp, `${claudePlan.remaining}\n`, "utf8");
+        fs.renameSync(tmp, claudeMd);
+        mark(claudeMd, "done");
+      }
+    } catch (err) {
+      for (const a of actions) if (!a.status) a.status = "not-done";
+      const done = actions.filter((a) => a.status === "done").map((a) => a.file);
+      return fail(`執行中斷：${err.message}${done.length ? `；已完成：${done.join(", ")}` : "（未動任何檔案）"}；其餘未執行`);
+    }
+  }
+
+  const next = [
+    "plugin 本體請另外執行：claude plugin uninstall codex-dispatch@codex-dispatch-plugin --scope local",
+    "（本指令永不碰 plans/、也不動 ~/.codex/config.toml 與官方 codex plugin）"
+  ];
+  emit({ ok: true, kind: "unwire", root, dryRun, actions, warnings, next }, options.json, renderUnwire);
+}
+
+function renderUnwire(r) {
+  const lines = [`codex-dispatch unwire — ${r.dryRun ? "預覽（dry-run，未動任何檔案）" : "已執行"}${r.root ? `  root=${r.root}` : ""}`];
+  if (!r.ok) lines.push(`✗ ${r.error}`);
+  if (r.actions?.length) {
+    lines.push(r.dryRun ? "將執行：" : "已執行：");
+    for (const a of r.actions) lines.push(`  - [${a.action}]${a.status ? ` (${a.status})` : ""} ${a.file}  ${a.detail}`);
+  } else if (r.ok) {
+    lines.push("（沒有可移除的接線）");
+  }
+  for (const w of r.warnings ?? []) lines.push(`  ${w}`);
+  if (r.ok && r.dryRun && r.actions?.length) lines.push("確認後加 --yes 執行。");
+  for (const n of r.next ?? []) lines.push(n);
+  return `${lines.join("\n")}\n`;
+}
+
 // ---------- 渲染 ----------
 function renderFindings(findings) {
   if (!findings || findings.length === 0) return "（無 findings）\n";
@@ -845,6 +993,8 @@ async function main() {
       return cmdState(rest);
     case "snippet":
       return cmdSnippet(rest);
+    case "unwire":
+      return cmdUnwire(rest);
     case "help":
     case "--help":
     case "-h":

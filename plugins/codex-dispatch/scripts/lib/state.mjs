@@ -168,6 +168,25 @@ export function releaseRound(root, key) {
   });
 }
 
+/**
+ * 刪除 state 檔（unwire --purge-state 用）：在鎖內進行，其他 session 持鎖時等待/逾時，不會硬刪別人正在寫的檔。
+ * 回傳實際刪掉的檔案清單。鎖檔本身由 withLock 的 finally 釋放。
+ */
+export function purgeState(root) {
+  const file = stateFile(root);
+  const pending = path.join(path.dirname(file), "codex-pending.md");
+  return withLock(root, () => {
+    const removed = [];
+    for (const p of [file, pending]) {
+      if (fs.existsSync(p)) {
+        fs.unlinkSync(p);
+        removed.push(p);
+      }
+    }
+    return removed;
+  });
+}
+
 export function bumpRound(root, key) {
   return withLock(root, () => {
     const st = loadState(root);
