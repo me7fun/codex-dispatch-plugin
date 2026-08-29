@@ -11,7 +11,8 @@ export const DEFAULTS = Object.freeze({
   onCodexUnavailable: "auto", // auto | ask | continue
   reviewMode: "adversarial", // adversarial | native
   planDir: "plans",
-  selfReview: "auto" // auto | ask | off：Codex 不可用時由 Claude subagent 自審
+  selfReview: "auto", // auto | ask | off：Codex 不可用時由 Claude subagent 自審
+  confidenceThreshold: 0.75 // 低於此信心的 finding 不進 findings（另列 lowConfidence，不自動修）
 });
 
 const ENUMS = {
@@ -48,7 +49,11 @@ export function loadConfig(root) {
       : DEFAULTS.onCodexUnavailable,
     reviewMode: ENUMS.reviewMode.includes(raw.reviewMode) ? raw.reviewMode : DEFAULTS.reviewMode,
     planDir: typeof raw.planDir === "string" && raw.planDir.trim() ? raw.planDir.trim() : DEFAULTS.planDir,
-    selfReview: ENUMS.selfReview.includes(raw.selfReview) ? raw.selfReview : DEFAULTS.selfReview
+    selfReview: ENUMS.selfReview.includes(raw.selfReview) ? raw.selfReview : DEFAULTS.selfReview,
+    confidenceThreshold:
+      typeof raw.confidenceThreshold === "number" && raw.confidenceThreshold >= 0 && raw.confidenceThreshold <= 1
+        ? raw.confidenceThreshold
+        : DEFAULTS.confidenceThreshold
   };
   return { config, source, warning };
 }

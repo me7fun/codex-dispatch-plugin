@@ -14,7 +14,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/dispatch.mjs" <子指令> --json ...
 ```
 
 子指令：`preflight`、`quota`、`review`、`plan-review <file>`、`rescue [--write] <prompt>`、`state`、`snippet`。一律前景執行（不要 `run_in_background`），review 通常 30–120 秒。
-設定檔 `<專案>/.claude/codex-dispatch.config.json`（缺檔用預設）：`quotaThreshold=95`、`lineThreshold=50`、`fileThreshold=3`、`maxRounds=3`、`onCodexUnavailable=auto`、`reviewMode=adversarial`、`planDir=plans`、`selfReview=auto`。
+設定檔 `<專案>/.claude/codex-dispatch.config.json`（缺檔用預設）：`quotaThreshold=95`、`lineThreshold=50`、`fileThreshold=3`、`maxRounds=3`、`onCodexUnavailable=auto`、`reviewMode=adversarial`、`planDir=plans`、`selfReview=auto`、`confidenceThreshold=0.75`。
 
 ## 分工
 - Claude（我）：規劃、架構、實作、套用修正。
@@ -24,15 +24,15 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/dispatch.mjs" <子指令> --json ...
 1. **估計**改動 > `lineThreshold` 行或 > `fileThreshold` 個檔案，或使用者直接說「先寫計畫」：
    a. 寫計畫到 `<planDir>/<slug>.md`（目標、涉及檔案、步驟、測試方式、不做什麼）。
    b. `plan-review <planDir>/<slug>.md --json`。採納合理意見修訂計畫（在計畫尾端記一行審查紀錄），再開始實作。
-2. 實作完成（尚未 commit）：`review --json`（預設 adversarial 模式，輸出結構化 findings）。
+2. 實作完成（尚未 commit）：`review --json`（預設 adversarial 模式＋內建嚴重度校準：HIGH 只算單人正常操作會碰到的缺陷，多 session／極端時序最高 MEDIUM，confidence 低於門檻的另列 `lowConfidence` 不自動修，沒有 HIGH 就 approve）。
    - 送審範圍是整個 working tree：若 `git status` 顯示有**不是我這次改的**未提交變更，先告知使用者「這些會一起被審」；要只審某段就用 `--base <ref>`／`--scope branch`。
    - CLI 會擋下疑似機密檔（.env、*.pem、credentials.json…），回 `local-error`：請使用者處理（移除／gitignore），不要自行加 `--allow-secrets`。
-   - `critical` / `high`：直接修正，重送 `review`。每輪修完若專案有測試就跑。上限 `maxRounds` 輪——**CLI 會強制**：同一批改動（repo + HEAD + 目標）送審達上限就回 `local-error`（訊息含 maxRounds），此時不要加 `--reset-rounds` 自行續審，交使用者裁決；`verdict=approve` 或 commit 後自動開新一輪（approve 只在沒有其他 session 同時在審時清計數）。
+   - `critical` / `high`：**先驗證再修**——照 finding 的 body 複現失敗情境（讀碼、跑測試、或寫最小重現）；複現得了才修，複現不了就降為 medium 列給使用者並說明為什麼。（研究顯示 Codex 審 Claude 的碼會過度修正，把沒問題的改壞；驗證是防線。）修正後重送 `review`。每輪修完若專案有測試就跑。
+   - 上限 `maxRounds` 輪——**CLI 會強制**：同一批改動（repo + HEAD + 目標）送審達上限就回 `local-error`（訊息含 maxRounds）。**到頂就真的停：剩下的 critical/high 只呈現、不修**，由使用者決定；使用者說修 → 修完 commit 開新一輪正常審。不要「順手修掉再記未審」——那會製造永遠審不完的尾巴。不要加 `--reset-rounds` 自行續審。`verdict=approve` 或 commit 後自動開新一輪。
    - **同一 finding（file + title 相同）連續兩輪都出現 → 視為無進展，停止並交使用者裁決。**
-   - `medium` / `low`：列出交使用者決定，不自行修改。
-   - 到頂仍有 critical/high → 列出交使用者。
+   - `medium` / `low` / `lowConfidence`：列出交使用者決定，不自行修改。
 3. 同一個 bug 嘗試修復 2 次仍失敗：停止嘗試，`rescue "<症狀、已試過什麼、相關檔案>" --json`（唯讀）。Codex 回的診斷／patch 建議由我套用。
-4. 使用者說「嚴格審查」「上線前檢查」：`review --adversarial "<focus>" --json`，focus 寫使用者關心的面向。
+4. 使用者說「嚴格審查」「上線前檢查」：`review --strict "<focus>" --json`（全對抗、不校準）。**只跑一次、不進迴圈**：結果整份呈現給使用者決定，不自動修（社群的「收斂後最終稽核」模式）。
 5. 小改動（字串、參數、樣式微調、註解、單檔 < 20 行）不送審。
 6. 官方 `codex-result-handling` skill 的「審完 STOP、不得自動修」規則**不適用**於本流程的 critical/high 自動修正；本 skill 優先。
 

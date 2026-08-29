@@ -24,9 +24,9 @@ Claude Code plugin：**「Claude 寫、Codex 審」的調度規則**。
 | 情境 | 行為 |
 |---|---|
 | 估計改動 >50 行或 >3 檔 | 先寫計畫 → Codex 審計畫 → 採納後才實作 |
-| 實作完成 | Codex 審 diff（結構化 findings）：critical/high 自動修正重審（上限 3 輪、無進展即停）；medium/low 交使用者 |
+| 實作完成 | Codex 審 diff（結構化 findings，**內建嚴重度校準**：HIGH 只算單人正常操作會碰到的缺陷、低信心 finding 另列不自動修、沒有 HIGH 即 approve）：critical/high **先驗證能複現再修**、重審（上限 3 輪；到頂剩下的只呈現不修，交使用者）；medium/low 交使用者 |
 | 同一 bug 修 2 次失敗 | 交 Codex 救援（唯讀診斷，Claude 套用建議） |
-| 使用者說「嚴格審查」 | adversarial review 帶 focus |
+| 使用者說「嚴格審查」 | `--strict` 全對抗 review（不校準），**只跑一次**當最終稽核，不進迴圈 |
 | 小改動 | 不送審 |
 | **Codex 失敗／額度用完** | 送審前先查額度（不耗額度）；失敗自動分類（額度／連線／輸出壞掉）；審 diff 失敗→**Claude 開獨立 subagent 自審**後記入未審清單繼續做，審計畫／救援失敗→詢問使用者（選項含「改由 Claude 自審」）。**絕不阻塞、絕不無限重試。** 收工前補審或逐項標記「⚠ 未經 Codex 審查（已由 Claude 自審）」 |
 
@@ -67,7 +67,7 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 |---|---|
 | `/codex-dispatch:setup [--write] [--local]` | 前置檢查 + 接線（CLAUDE.md 或 CLAUDE.local.md） |
 | `/codex-dispatch:status` | Codex 額度（不耗額度）+ 未審清單 |
-| `/codex-dispatch:review [--adversarial\|--native] [--base ref] [--scope s] [focus]` | 手動送審目前改動 |
+| `/codex-dispatch:review [--adversarial\|--native\|--strict] [--base ref] [--scope s] [focus]` | 手動送審目前改動（`--strict` = 全對抗最終稽核） |
 | `/codex-dispatch:uninstall [--purge-config] [--purge-state]` | 反接線：移除 CLAUDE.md 段（預設只預覽、再確認），可選一併 `claude plugin uninstall` |
 
 平常不需要打指令——SessionStart hook 會注入規則摘要，Claude 依 Skill `codex-dispatch:dispatch` 自動調度。
@@ -84,12 +84,16 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
   "onCodexUnavailable": "auto",
   "reviewMode": "adversarial",
   "planDir": "plans",
-  "selfReview": "auto"
+  "selfReview": "auto",
+  "confidenceThreshold": 0.75
 }
 ```
+- `confidenceThreshold`：Codex 給每條 finding 的信心低於此值 → 移到 `lowConfidence`，只呈現、不自動修、不影響 verdict。
 - `onCodexUnavailable`：`auto`（審 diff→繼續、審計畫/救援→詢問）｜`ask`（全部詢問）｜`continue`（全部繼續）
 - `selfReview`：Codex 不可用時的降級——`auto`（審 diff 失敗自動由 Claude 唯讀 subagent 自審）｜`ask`（每次先問）｜`off`。自審過的條目仍留在未審清單（標「[自審]」），額度恢復後仍建議補審。prompt 有三個變體（審 diff／審計畫／rescue 重新診斷）在 `prompts/self-review.md`。手動的 `/codex-dispatch:review` 不會自審，它只回報 Codex 結果。
-- `reviewMode`：`adversarial`（結構化 JSON，自動迴圈用）｜`native`（Codex 原生審查，純文字，只呈現不自動修）
+- `reviewMode`：`adversarial`（結構化 JSON＋嚴重度校準，自動迴圈用）｜`native`（Codex 原生審查，純文字，只呈現不自動修）
+
+**為什麼要校準**：官方 adversarial prompt 的定義是「只要有任何實質風險就 needs-attention，找不到任何可成立的對抗性發現才 approve」——它是拿來打擊信心的最終稽核，不是拿來收斂的。直接用它跑迴圈，每批改動都會跑滿 3 輪、而且越修越偏向「兩個視窗同一毫秒」這類極端情境（本 repo 早期就是這樣，留下一堆「修了但沒再審」的尾巴）。社群做法與研究一致：迴圈用一般審查、2–3 輪收斂、confidence ≥ 0.75 才算、對抗式只在最後跑一次；另有研究指出 Codex 審 Claude 的碼會過度修正，所以修 HIGH 前先驗證能複現。詳見 `plans/` 審查紀錄。
 
 ## 底層 CLI
 

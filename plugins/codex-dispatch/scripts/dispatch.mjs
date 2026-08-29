@@ -7,8 +7,10 @@
  *   quota                         Codex 額度快照（available / exhausted / unknown）
  *   preflight [--write-windows-sandbox]
  *                                 綜合檢查：官方 plugin、codex 登入、git repo、Windows 沙箱設定、額度
- *   review [--adversarial|--native] [--base <ref>] [--scope auto|working-tree|branch] [--retries N] [--allow-secrets] [--reset-rounds] [focus...]
- *                                 送審 diff（預設模式依設定 reviewMode）。機密檔閘門；同一批改動（repo+HEAD+目標）最多 maxRounds 輪
+ *   review [--adversarial|--native|--strict] [--base <ref>] [--scope auto|working-tree|branch] [--retries N] [--allow-secrets] [--reset-rounds] [focus...]
+ *                                 送審 diff（預設模式依設定 reviewMode）。adversarial 模式自動附嚴重度校準（HIGH 限單人正常操作、
+ *                                 confidence 門檻、沒有 HIGH 即 approve）；--strict 為全對抗不校準，只給「嚴格審查」用且只跑一次。
+ *                                 機密檔閘門；同一批改動（repo+HEAD+目標）最多 maxRounds 輪
  *   plan-review <file> [--model m] [--effort e] [--allow-secrets]
  *                                 請 Codex 唯讀審計畫檔，要求回 JSON
  *   rescue [--write] [--model m] [--effort e] [--prompt-file f] [--allow-secrets] [prompt...]
@@ -308,6 +310,37 @@ function interpretSpawn(r) {
 }
 
 // ---------- review ----------
+/**
+ * 自動迴圈用的嚴重度校準（附在 adversarial focus 前面）。
+ * 官方 adversarial prompt 被設計成「只要有任何實質風險就 needs-attention」，幾乎不會 approve，
+ * 拿來跑迴圈會每批都撞上限、而且越修越偏極端情境。這段把 HIGH 限縮在單人正常操作就會碰到的缺陷。
+ * --strict 時不加（全對抗，只跑一次當最終稽核）。
+ */
+function calibrationText(threshold) {
+  return [
+    "Severity calibration (mandatory, overrides any default rubric):",
+    "- CRITICAL/HIGH only for defects a single user hits in normal operation with default configuration.",
+    "- Scenarios that require multiple concurrent sessions, races between separate processes, an external editor modifying files mid-operation, clock changes, or multi-hour suspensions are MEDIUM at most.",
+    `- Do not report a finding unless your confidence is >= ${threshold}; omit speculative items entirely.`,
+    "- Verdict rule: 'approve' when no CRITICAL or HIGH finding remains; 'needs-attention' only when at least one CRITICAL or HIGH remains.",
+    "Review focus:"
+  ].join("\n");
+}
+
+/** 依 confidence 門檻把 findings 分成正式 findings 與 lowConfidence（後者只呈現、不自動修） */
+function splitByConfidence(findings, threshold) {
+  const keep = [];
+  const low = [];
+  for (const f of findings ?? []) {
+    // 沒給 confidence、不是數字、或超出 0..1 → 一律當低信心（不能讓缺欄位的 finding 繞過門檻）
+    const c = f.confidence;
+    const valid = typeof c === "number" && Number.isFinite(c) && c >= 0 && c <= 1;
+    if (!valid || c < threshold) low.push({ ...f, confidence: valid ? c : null });
+    else keep.push(f);
+  }
+  return { findings: keep, lowConfidence: low };
+}
+
 function interpretReview(mode) {
   return (r, payload) => {
     const spawnErr = interpretSpawn(r);
@@ -366,12 +399,14 @@ function interpretReview(mode) {
 async function cmdReview(argv) {
   const { options, positionals } = parseArgv(argv, {
     valueOptions: ["base", "scope", "cwd", "retries"],
-    booleanOptions: ["json", "adversarial", "native", "allow-secrets", "reset-rounds"]
+    booleanOptions: ["json", "adversarial", "native", "strict", "allow-secrets", "reset-rounds"]
   });
   const root = projectRoot(options.cwd);
   const { config: cfg } = loadConfig(root);
-  const mode = options.adversarial ? "adversarial" : options.native ? "native" : cfg.reviewMode;
-  const focus = positionals.join(" ").trim();
+  const mode = options.adversarial || options.strict ? "adversarial" : options.native ? "native" : cfg.reviewMode;
+  const strict = Boolean(options.strict); // 全對抗、不校準：只給「嚴格審查」用，且只跑一次
+  const userFocus = positionals.join(" ").trim();
+  const focus = mode === "adversarial" && !strict ? `${calibrationText(cfg.confidenceThreshold)}\n${userFocus || "Implementation defects and correctness of the change."}` : userFocus;
   if (!gitTopLevel(root)) return emit(localError("review", `${root} 不是 git repo；Codex review 依賴 git diff，請先 git init`), options.json, renderReview);
   const retries = parseRetries(options.retries);
   if (retries === null) return emit(localError("review", `--retries 必須是 0..${MAX_RETRIES} 的整數`), options.json, renderReview);
@@ -414,9 +449,21 @@ async function cmdReview(argv) {
     retries
   });
   result.mode = mode;
+  result.strict = strict;
   result.round = round;
   result.maxRounds = cfg.maxRounds;
   result.cycleKey = cycleKey;
+  if (result.ok && Array.isArray(result.findings)) {
+    const split = splitByConfidence(result.findings, cfg.confidenceThreshold);
+    result.findings = split.findings;
+    result.lowConfidence = split.lowConfidence;
+    result.confidenceThreshold = cfg.confidenceThreshold;
+    if (!strict) {
+      // 校準模式：verdict 依過濾後的 findings 重算（沒有 critical/high 就 approve），否則會出現「沒有可修項目卻 needs-attention」
+      result.modelVerdict = result.verdict;
+      result.verdict = result.findings.some((f) => f.severity === "critical" || f.severity === "high") ? "needs-attention" : "approve";
+    }
+  }
   if (!result.ok && (result.reason === "quota" || result.reason === "local-error")) {
     // Codex 根本沒跑（額度不足／本地錯誤）→ 退回自己這一次佔用，額度恢復後不會被 maxRounds 擋住
     releaseRound(root, cycleKey, reserved.reservationId);
@@ -424,9 +471,10 @@ async function cmdReview(argv) {
     result.roundReleased = true;
   } else {
     // 完成：解除自己的登記；approve 且沒有其他 session 進行中才清整個 cycle（沒 commit 的專案靠這條開新輪）
+    // 注意：verdict 已在上面依 confidence 過濾重算過，這裡用的是最終 verdict
     result.cycleReset = completeRound(root, cycleKey, reserved.reservationId, { approve: result.ok && result.verdict === "approve" });
   }
-  if (focus && mode === "native") result.note = "native review 不支援 focus 文字，已忽略；要帶 focus 請用 --adversarial";
+  if (userFocus && mode === "native") result.note = "native review 不支援 focus 文字，已忽略；要帶 focus 請用 --adversarial";
   emit(result, options.json, renderReview);
 }
 
@@ -1072,7 +1120,8 @@ function renderReview(r) {
   if (!r.ok) return renderFailure(r);
   const head = `# Codex ${r.kind}${r.mode ? ` (${r.mode})` : ""}\nTarget: ${r.target?.label ?? "?"}${r.round ? `\nRound: ${r.round}/${r.maxRounds}` : ""}${r.quota ? `\n${quotaMessage(r.quota)}` : ""}\n`;
   if (r.verdict === null || r.verdict === undefined) return `${head}\n${r.raw ?? ""}\n${r.note ? `\n（${r.note}）\n` : ""}`;
-  return `${head}\nVerdict: ${r.verdict}\n${r.summary ? `${r.summary}\n` : ""}\n## Findings\n${renderFindings(r.findings)}${r.nextSteps?.length ? `\n## Next steps\n${r.nextSteps.map((s) => `- ${s}`).join("\n")}\n` : ""}`;
+  const low = r.lowConfidence?.length ? `\n## Low confidence (< ${r.confidenceThreshold}，只供參考、不自動修)\n${renderFindings(r.lowConfidence)}` : "";
+  return `${head}${r.strict ? "Mode: strict adversarial（未校準，只跑一次）\n" : ""}\nVerdict: ${r.verdict}\n${r.summary ? `${r.summary}\n` : ""}\n## Findings\n${renderFindings(r.findings)}${low}${r.nextSteps?.length ? `\n## Next steps\n${r.nextSteps.map((s) => `- ${s}`).join("\n")}\n` : ""}`;
 }
 
 function renderRescue(r) {

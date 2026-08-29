@@ -1,6 +1,6 @@
 ---
 description: 手動送 Codex 審查目前改動（經 codex-dispatch：額度預檢、失敗分類、未審清單）
-argument-hint: "[--adversarial|--native] [--base <ref>] [--scope auto|working-tree|branch] [focus...]"
+argument-hint: "[--adversarial|--native|--strict] [--base <ref>] [--scope auto|working-tree|branch] [focus...]"
 allowed-tools: Bash(node:*), Bash(git:*)
 ---
 
