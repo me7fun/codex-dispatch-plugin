@@ -55,13 +55,17 @@ claude plugin marketplace add me7fun/codex-dispatch-plugin
 # 在目標專案根目錄：
 claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 ```
-然後在 Claude Code 內執行 `/codex-dispatch:setup`：檢查上述前置條件、把 5 行規則段接線到專案 `CLAUDE.md`。
+然後在 Claude Code 內執行 `/codex-dispatch:setup`：檢查上述前置條件、把 5 行規則段接線到專案。接線目標會問你選一個：
+- **`CLAUDE.md`**：進 git，全隊共用（團隊專案）。
+- **`CLAUDE.local.md`**：只在本機、不進 git（個人專案、或不想讓 clone 的人看到；Claude Code 會與 CLAUDE.md 一起載入）。記得把它加進 `.gitignore`，setup 會提醒但不代改。
+
+之後 setup / uninstall 都會自動偵測段落在哪個檔；要換目標先 `/codex-dispatch:uninstall` 再 setup。
 
 ## 指令
 
 | 指令 | 用途 |
 |---|---|
-| `/codex-dispatch:setup [--write]` | 前置檢查 + 接線 CLAUDE.md |
+| `/codex-dispatch:setup [--write] [--local]` | 前置檢查 + 接線（CLAUDE.md 或 CLAUDE.local.md） |
 | `/codex-dispatch:status` | Codex 額度（不耗額度）+ 未審清單 |
 | `/codex-dispatch:review [--adversarial\|--native] [--base ref] [--scope s] [focus]` | 手動送審目前改動 |
 | `/codex-dispatch:uninstall [--purge-config] [--purge-state]` | 反接線：移除 CLAUDE.md 段（預設只預覽、再確認），可選一併 `claude plugin uninstall` |
@@ -112,7 +116,7 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 ```
 /codex-dispatch:uninstall
 ```
-只移除 setup 寫進 `CLAUDE.md` 的標記段（先預覽、再確認）。`.claude/codex-dispatch.config.json`（你的設定）與 `.claude/state/`（未審清單）預設保留，要清才加 `--purge-config` / `--purge-state`；`plans/` 永不碰。plugin 本體由指令最後詢問是否執行 `claude plugin uninstall codex-dispatch@codex-dispatch-plugin --scope local`。
+只移除 setup 寫進 `CLAUDE.md` 或 `CLAUDE.local.md` 的標記段（自動偵測在哪；先預覽、再確認；動手前備份到 `.claude/state/`）。`.claude/codex-dispatch.config.json`（你的設定）與 `.claude/state/`（未審清單）預設保留，要清才加 `--purge-config` / `--purge-state`；`plans/` 永不碰。plugin 本體由指令最後詢問是否執行 `claude plugin uninstall codex-dispatch@codex-dispatch-plugin --scope local`。
 
 底層：`node <plugin>/scripts/dispatch.mjs unwire [--yes] [--purge-config] [--purge-state] [--root <dir>]`。
 

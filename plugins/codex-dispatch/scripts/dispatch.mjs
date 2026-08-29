@@ -15,9 +15,11 @@
  *                                 救援：預設唯讀（診斷＋建議 patch）；--write 才讓 Codex 改碼
  *   state [--list] | --add-unreviewed <desc> [--reason r] [--kind k] [--scope s] [--error msg] [--self-reviewed] | --clear [--id x]
  *                                 未審清單（--self-reviewed：已由 Claude subagent 自審，仍未經 Codex）
- *   snippet [--write]             印出（或寫入）目標專案 CLAUDE.md 的 codex-dispatch 段
+ *   snippet [--write] [--target claude|local | --local]
+ *                                 印出（或寫入）codex-dispatch 段。目標：CLAUDE.md（進 git）或 CLAUDE.local.md（只在本機）；
+ *                                 未指定時沿用已接線的那個檔，都沒有則 CLAUDE.md；兩檔都有或另一檔已接線 → 拒絕
  *   unwire [--yes] [--purge-config] [--purge-state] [--root <dir>]
- *                                 反接線：移除 CLAUDE.md 的 codex-dispatch 段（預設 dry-run）。
+ *                                 反接線：從 CLAUDE.md / CLAUDE.local.md 移除 codex-dispatch 段（預設 dry-run）。
  *                                 config / state 是使用者設定與工作流狀態，預設保留，要加旗標才刪；永不碰 plans/。
  *                                 plugin 本體另外用 claude plugin uninstall。
  *
@@ -32,7 +34,7 @@ import { projectRoot, gitTopLevel, gitHeadSha, gitChangedPathsForGate, gitDiffPa
 import { resolveCompanion, runCompanion, parseJsonLoose, tailLines } from "./lib/companion.mjs";
 import { readQuota } from "./lib/quota.mjs";
 import { loadConfig, CONFIG_REL, DEFAULTS } from "./lib/config.mjs";
-import { loadState, addUnreviewed, clearUnreviewed, reserveRound, releaseRound, resetRounds, completeRound, purgeState, stateFile } from "./lib/state.mjs";
+import { loadState, addUnreviewed, clearUnreviewed, reserveRound, releaseRound, resetRounds, completeRound, purgeState, stateFile, withLock } from "./lib/state.mjs";
 
 const SEVERITIES = ["critical", "high", "medium", "low"];
 const VERDICTS = ["approve", "needs-attention"];
@@ -770,28 +772,115 @@ function snippetText() {
   ].join("\n");
 }
 
+/** 接線目標：CLAUDE.md（進 git，全隊共用）或 CLAUDE.local.md（只在本機）。兩者 Claude Code 都會載入。 */
+const SNIPPET_TARGETS = { claude: "CLAUDE.md", local: "CLAUDE.local.md" };
+
+/**
+ * 掃描兩個候選檔的標記狀態。回 [{name, file, state: "missing"|"absent"|"valid"|"invalid", error?, lines?, loc?}]
+ * 任何寫入／移除都必須先跑這個；有 invalid 就不得動任何檔。
+ */
+function scanSnippetTargets(root) {
+  return Object.entries(SNIPPET_TARGETS).map(([name, base]) => {
+    const file = path.join(root, base);
+    const symlinkErr = refuseSymlink(file);
+    if (symlinkErr) return { name, file, state: "invalid", error: symlinkErr };
+    if (!fs.existsSync(file)) return { name, file, state: "missing" };
+    const text = fs.readFileSync(file, "utf8");
+    const lines = text.split(/\r?\n/);
+    const loc = locateSnippet(lines);
+    if (loc.error) return { name, file, state: "invalid", error: loc.error, text };
+    if (loc.absent) return { name, file, state: "absent", text };
+    return { name, file, state: "valid", loc, lines, text };
+  });
+}
+
+/** CLAUDE.local.md 是否會被 git 忽略／是否已被追蹤（用 git 的有效規則，不自己讀 .gitignore） */
+function gitIgnoreStatus(root, rel) {
+  const inRepo = Boolean(gitTopLevel(root));
+  if (!inRepo) return { git: false };
+  const tracked = spawnSync("git", ["ls-files", "--error-unmatch", "--", rel], { cwd: root, encoding: "utf8", windowsHide: true }).status === 0;
+  const ignored = spawnSync("git", ["check-ignore", "-q", "--", rel], { cwd: root, encoding: "utf8", windowsHide: true }).status === 0;
+  return { git: true, tracked, ignored };
+}
+
 function cmdSnippet(argv) {
-  const { options } = parseArgv(argv, { valueOptions: ["cwd"], booleanOptions: ["json", "write"] });
+  const { options } = parseArgv(argv, { valueOptions: ["cwd", "target"], booleanOptions: ["json", "write", "local"] });
   const root = projectRoot(options.cwd);
-  const file = path.join(root, "CLAUDE.md");
   const snippet = snippetText();
-  const symlinkErr = refuseSymlink(file);
-  if (symlinkErr) return emit(localError("snippet", symlinkErr), options.json, (x) => `✗ ${x.error}\n`);
-  const existing = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-  const has = existing.includes(SNIPPET_START) && existing.includes(SNIPPET_END);
+  const render = (x) => {
+    if (!x.ok) return `✗ ${x.error}\n`;
+    const where = x.presentIn.length ? `（已接線：${x.presentIn.join("、")}）` : "（尚未接線：CLAUDE.md / CLAUDE.local.md 都沒有標記段）";
+    const w = (x.warnings ?? []).map((s) => `  ⚠ ${s}`).join("\n");
+    if (x.written) return `${x.updated ? "已更新" : "已寫入"} ${x.file}\n${w ? `${w}\n` : ""}`;
+    return `${where}\n${w ? `${w}\n` : ""}\n${x.snippet}`;
+  };
+  const fail = (error) => emit(localError("snippet", error), options.json, render);
+
+  const targetName0 = options.target || (options.local ? "local" : null);
+  if (targetName0 && !SNIPPET_TARGETS[targetName0]) return fail(`--target 只接受 claude 或 local（收到「${targetName0}」）`);
+
   if (!options.write) {
-    return emit({ ok: true, kind: "snippet", file, present: has, snippet }, options.json, (x) => `${x.present ? `（${x.file} 已含此段）` : `（尚未寫入 ${x.file}）`}\n\n${x.snippet}`);
+    const scan = scanSnippetTargets(root);
+    const invalid = scan.filter((s) => s.state === "invalid");
+    if (invalid.length) return fail(invalid.map((s) => `${s.file}：${s.error}`).join("；"));
+    const presentIn = scan.filter((s) => s.state === "valid").map((s) => path.basename(s.file));
+    const warnings = presentIn.length > 1 ? ["CLAUDE.md 與 CLAUDE.local.md 都含標記段；請保留一個（可用 unwire 清掉再 setup）"] : [];
+    return emit({ ok: true, kind: "snippet", presentIn, files: scan.map((s) => ({ file: s.file, state: s.state })), warnings, snippet }, options.json, render);
   }
-  let next;
-  if (has) {
-    const a = existing.indexOf(SNIPPET_START);
-    const b = existing.indexOf(SNIPPET_END) + SNIPPET_END.length;
-    next = `${existing.slice(0, a)}${snippet.trimEnd()}${existing.slice(b)}`;
-  } else {
-    next = `${existing}${existing && !existing.endsWith("\n") ? "\n" : ""}${existing ? "\n" : ""}${snippet}`;
+
+  // 寫入：整段在專案鎖內做（掃描 → 決定目標 → 寫），兩個視窗同時 setup 也不會各寫一個檔；temp 檔失敗時清掉
+  let outcome;
+  try {
+    outcome = withLock(root, () => {
+      const scan = scanSnippetTargets(root);
+      const invalid = scan.filter((s) => s.state === "invalid");
+      if (invalid.length) return { error: invalid.map((s) => `${s.file}：${s.error}`).join("；") };
+      const valid = scan.filter((s) => s.state === "valid");
+      if (valid.length > 1) return { error: "兩個檔都含標記段，拒絕寫入；請先 unwire 清理" };
+      // 決定目標：明確指定 > 已接線的那個檔 > 預設 CLAUDE.md
+      const existingTarget = valid[0] ?? null;
+      const targetName = targetName0 || (existingTarget ? existingTarget.name : "claude");
+      if (existingTarget && existingTarget.name !== targetName) {
+        return { error: `${path.basename(existingTarget.file)} 已含標記段，不能再寫到 ${SNIPPET_TARGETS[targetName]}（會雙重接線）；要換目標請先 unwire` };
+      }
+      const target = scan.find((s) => s.name === targetName);
+      const warnings = [];
+      if (targetName === "local") {
+        const gs = gitIgnoreStatus(root, SNIPPET_TARGETS.local);
+        if (gs.git && gs.tracked) warnings.push("CLAUDE.local.md 已被 git 追蹤——它本該只在本機；請 git rm --cached 並加入 .gitignore");
+        else if (gs.git && !gs.ignored) warnings.push("CLAUDE.local.md 未被 .gitignore 忽略；建議加一行 CLAUDE.local.md（本工具不代改 .gitignore）");
+      }
+      let next;
+      if (target.state === "valid") {
+        const { start, end } = target.loc;
+        const lines = [...target.lines.slice(0, start), ...snippet.trimEnd().split("\n"), ...target.lines.slice(end + 1)];
+        next = `${lines.join("\n").replace(/\n*$/, "")}\n`;
+      } else {
+        const existing = target.text ?? "";
+        next = `${existing}${existing && !existing.endsWith("\n") ? "\n" : ""}${existing ? "\n" : ""}${snippet}`;
+      }
+      const tmp = `${target.file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+      try {
+        fs.writeFileSync(tmp, next, "utf8");
+        // rename 前最後一次確認目標沒在掃描後被改（鎖擋得住我們自己，擋不住外部編輯器）
+        const nowText = fs.existsSync(target.file) ? fs.readFileSync(target.file, "utf8") : null;
+        if ((target.text ?? null) !== nowText) throw new Error(`${target.file} 在掃描之後被修改，為避免蓋掉新內容而中止；請重新執行`);
+        fs.renameSync(tmp, target.file);
+      } catch (err) {
+        try {
+          fs.unlinkSync(tmp);
+        } catch {
+          /* ignore */
+        }
+        return { error: err.message };
+      }
+      return { file: target.file, updated: target.state === "valid", warnings };
+    });
+  } catch (err) {
+    return fail(`無法取得專案鎖：${err.message}`);
   }
-  fs.writeFileSync(file, next, "utf8");
-  emit({ ok: true, kind: "snippet", file, present: true, updated: has, snippet }, options.json, (x) => `${x.updated ? "已更新" : "已寫入"} ${x.file}\n`);
+  if (outcome.error) return fail(outcome.error);
+  emit({ ok: true, kind: "snippet", file: outcome.file, presentIn: [path.basename(outcome.file)], written: true, updated: outcome.updated, warnings: outcome.warnings, snippet }, options.json, render);
 }
 
 // ---------- unwire（反接線） ----------
@@ -834,29 +923,26 @@ function cmdUnwire(argv) {
   if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) return fail(`專案根不存在：${root}`);
 
   // ===== 階段 1：只規劃，不動任何檔案 =====
-  const claudeMd = path.join(root, "CLAUDE.md");
   const cfgFile = path.join(root, CONFIG_REL);
   const stFile = stateFile(root);
   const pendingFile = path.join(path.dirname(stFile), "codex-pending.md");
-  for (const f of [claudeMd, cfgFile, stFile, pendingFile]) {
+  for (const f of [...Object.values(SNIPPET_TARGETS).map((b) => path.join(root, b)), cfgFile, stFile, pendingFile]) {
     const err = unsafePath(root, f);
     if (err) return fail(err);
   }
 
-  let claudePlan = null; // {mode:"delete"|"modify", remaining, loc, hash}
+  // CLAUDE.md 與 CLAUDE.local.md 都掃；任一檔標記畸形 → 整體中止（尚未動任何檔）
   const sha = (text) => crypto.createHash("sha256").update(text).digest("hex");
-  if (fs.existsSync(claudeMd)) {
-    const original = fs.readFileSync(claudeMd, "utf8");
-    const lines = original.split(/\r?\n/);
-    const loc = locateSnippet(lines);
-    if (loc.error) return fail(`${claudeMd}：${loc.error}`);
-    if (!loc.absent) {
-      const rest = [...lines.slice(0, loc.start), ...lines.slice(loc.end + 1)];
-      while (rest.length && rest[rest.length - 1].trim() === "") rest.pop();
-      const remaining = rest.join("\n");
-      const hash = sha(original); // 執行前重讀比對，避免用過期快照蓋掉別人剛改的內容
-      claudePlan = remaining.trim() === "" ? { mode: "delete", loc, hash } : { mode: "modify", loc, remaining, kept: rest.length, hash };
-    }
+  const scan = scanSnippetTargets(root);
+  const invalid = scan.filter((s) => s.state === "invalid");
+  if (invalid.length) return fail(invalid.map((s) => `${s.file}：${s.error}`).join("；"));
+  const claudePlans = []; // [{file, mode:"delete"|"modify", remaining, loc, hash}]
+  for (const s of scan.filter((x) => x.state === "valid")) {
+    const rest = [...s.lines.slice(0, s.loc.start), ...s.lines.slice(s.loc.end + 1)];
+    while (rest.length && rest[rest.length - 1].trim() === "") rest.pop();
+    const remaining = rest.join("\n");
+    const hash = sha(s.text); // 執行前重讀比對，避免用過期快照蓋掉別人剛改的內容
+    claudePlans.push(remaining.trim() === "" ? { file: s.file, mode: "delete", loc: s.loc, hash } : { file: s.file, mode: "modify", loc: s.loc, remaining, kept: rest.length, hash });
   }
 
   const purgeConfig = options["purge-config"] && fs.existsSync(cfgFile);
@@ -875,8 +961,10 @@ function cmdUnwire(argv) {
   // 規劃清單（執行順序：state → config → CLAUDE.md；最可能失敗的鎖操作放最前，失敗時什麼都還沒動）
   if (purgeStateWanted) for (const p of statePaths) actions.push({ file: p, action: "delete", detail: "--purge-state（在 state 鎖內刪除）" });
   if (purgeConfig) actions.push({ file: cfgFile, action: "delete", detail: "--purge-config" });
-  if (claudePlan?.mode === "delete") actions.push({ file: claudeMd, action: "delete", detail: `刪除標記段（第 ${claudePlan.loc.start + 1}–${claudePlan.loc.end + 1} 行）後整檔為空，刪除檔案` });
-  if (claudePlan?.mode === "modify") actions.push({ file: claudeMd, action: "modify", detail: `刪除標記段第 ${claudePlan.loc.start + 1}–${claudePlan.loc.end + 1} 行，其餘 ${claudePlan.kept} 行保留` });
+  for (const p of claudePlans) {
+    if (p.mode === "delete") actions.push({ file: p.file, action: "delete", detail: `刪除標記段（第 ${p.loc.start + 1}–${p.loc.end + 1} 行）後整檔為空，刪除檔案` });
+    else actions.push({ file: p.file, action: "modify", detail: `刪除標記段第 ${p.loc.start + 1}–${p.loc.end + 1} 行，其餘 ${p.kept} 行保留` });
+  }
 
   // ===== 階段 2：執行（每一步前重新驗證路徑，防檢查後被換成 symlink；任一步失敗回報已完成/未完成）=====
   if (!dryRun) {
@@ -890,18 +978,22 @@ function cmdUnwire(argv) {
     };
     // 外部編輯器不會配合我們的鎖，雜湊檢查與 rename 之間永遠有空隙 → 動手前先備份到 state 目錄，撞到也找得回來
     const backupDir = path.dirname(stateFile(root));
-    const guardClaudeMd = () => {
-      guard(claudeMd);
-      const current = fs.readFileSync(claudeMd, "utf8");
-      if (sha(current) !== claudePlan.hash) throw new Error(`${claudeMd} 在預覽之後被修改過，為避免蓋掉新內容而中止；請重新執行 unwire`);
+    const guardClaudeMd = (p) => {
+      guard(p.file);
+      const current = fs.readFileSync(p.file, "utf8");
+      if (sha(current) !== p.hash) throw new Error(`${p.file} 在預覽之後被修改過，為避免蓋掉新內容而中止；請重新執行 unwire`);
       fs.mkdirSync(backupDir, { recursive: true });
-      const backup = path.join(backupDir, `CLAUDE.md.${new Date().toISOString().replace(/[:.]/g, "-")}.bak`);
+      const backup = path.join(backupDir, `${path.basename(p.file)}.${new Date().toISOString().replace(/[:.]/g, "-")}.bak`);
       fs.writeFileSync(backup, current, "utf8");
-      warnings.push(`已備份原 CLAUDE.md → ${backup}`);
+      warnings.push(`已備份原 ${path.basename(p.file)} → ${backup}`);
     };
     try {
+      // 先把所有目標檢查完、備份完（零修改），任一失敗此時中止什麼都沒動；全部通過才進入破壞性操作
+      for (const p of claudePlans) guardClaudeMd(p);
+      if (purgeStateWanted) for (const p of statePaths) guard(p);
+      if (purgeConfig) guard(cfgFile);
+
       if (purgeStateWanted) {
-        for (const p of statePaths) guard(p);
         purgeState(root); // 拿不到鎖會拋錯 → 此時尚未動任何檔案
         for (const p of statePaths) mark(p, "done");
       }
@@ -910,18 +1002,19 @@ function cmdUnwire(argv) {
         fs.unlinkSync(cfgFile);
         mark(cfgFile, "done");
       }
-      if (claudePlan?.mode === "delete") {
-        guardClaudeMd();
-        fs.unlinkSync(claudeMd); // unlink 不跟隨 symlink
-        mark(claudeMd, "done");
-      }
-      if (claudePlan?.mode === "modify") {
-        guardClaudeMd();
-        // 寫暫存檔再 rename：rename 取代的是目標本身，不會跟隨 symlink 寫到別處
-        const tmp = `${claudeMd}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
-        fs.writeFileSync(tmp, `${claudePlan.remaining}\n`, "utf8");
-        fs.renameSync(tmp, claudeMd);
-        mark(claudeMd, "done");
+      for (const p of claudePlans) {
+        // 動手前一刻再驗一次路徑與內容雜湊（備份已在 preflight 做過）：縮小「別人剛改了、我用舊快照蓋掉」的窗口
+        guard(p.file);
+        if (sha(fs.readFileSync(p.file, "utf8")) !== p.hash) throw new Error(`${p.file} 在檢查之後又被修改，為避免蓋掉新內容而中止；請重新執行 unwire`);
+        if (p.mode === "delete") {
+          fs.unlinkSync(p.file); // unlink 不跟隨 symlink
+        } else {
+          // 寫暫存檔再 rename：rename 取代的是目標本身，不會跟隨 symlink 寫到別處
+          const tmp = `${p.file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+          fs.writeFileSync(tmp, `${p.remaining}\n`, "utf8");
+          fs.renameSync(tmp, p.file);
+        }
+        mark(p.file, "done");
       }
     } catch (err) {
       for (const a of actions) if (!a.status) a.status = "not-done";

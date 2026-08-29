@@ -1,5 +1,5 @@
 ---
-description: 反接線：移除 setup 寫進本專案 CLAUDE.md 的 codex-dispatch 段（預設只預覽），並可選擇一併移除 plugin 本體
+description: 反接線：移除 setup 寫進本專案 CLAUDE.md 或 CLAUDE.local.md 的 codex-dispatch 段（自動偵測在哪；預設只預覽），並可選擇一併移除 plugin 本體
 argument-hint: "[--purge-config] [--purge-state]"
 allowed-tools: Bash(node:*), Bash(claude:*), AskUserQuestion
 ---

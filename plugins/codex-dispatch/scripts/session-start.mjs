@@ -28,8 +28,11 @@ try {
   }
   const root = process.env.CLAUDE_PROJECT_DIR && fs.existsSync(process.env.CLAUDE_PROJECT_DIR) ? process.env.CLAUDE_PROJECT_DIR : cwd;
   const hasConfig = fs.existsSync(path.join(root, ".claude", "codex-dispatch.config.json"));
-  const claudeMd = path.join(root, "CLAUDE.md");
-  const hasMarker = fs.existsSync(claudeMd) && fs.readFileSync(claudeMd, "utf8").includes("<!-- codex-dispatch:start -->");
+  // 接線段可能在 CLAUDE.md（進 git）或 CLAUDE.local.md（只在本機），Claude Code 兩個都載入
+  const hasMarker = ["CLAUDE.md", "CLAUDE.local.md"].some((base) => {
+    const f = path.join(root, base);
+    return fs.existsSync(f) && fs.readFileSync(f, "utf8").includes("<!-- codex-dispatch:start -->");
+  });
   const wired = hasConfig || hasMarker;
 
   const stateFile = path.join(root, ".claude", "state", "codex-dispatch.json");
