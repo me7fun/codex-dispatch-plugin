@@ -28,11 +28,22 @@ try {
   }
   const root = process.env.CLAUDE_PROJECT_DIR && fs.existsSync(process.env.CLAUDE_PROJECT_DIR) ? process.env.CLAUDE_PROJECT_DIR : cwd;
   const hasConfig = fs.existsSync(path.join(root, ".claude", "codex-dispatch.config.json"));
-  // 接線段可能在 CLAUDE.md（進 git）或 CLAUDE.local.md（只在本機），Claude Code 兩個都載入
-  const hasMarker = ["CLAUDE.md", "CLAUDE.local.md"].some((base) => {
+  // 接線段可能在 CLAUDE.md（進 git）或 CLAUDE.local.md（只在本機），Claude Code 兩個都載入。
+  // 判定與 dispatch.mjs 的 locateSnippet 同一套：start/end 各恰好一個且 start 在前才算有效；壞掉的要提示修復，不能當成已接線。
+  const START = "<!-- codex-dispatch:start -->";
+  const END = "<!-- codex-dispatch:end -->";
+  const broken = [];
+  let hasMarker = false;
+  for (const base of ["CLAUDE.md", "CLAUDE.local.md"]) {
     const f = path.join(root, base);
-    return fs.existsSync(f) && fs.readFileSync(f, "utf8").includes("<!-- codex-dispatch:start -->");
-  });
+    if (!fs.existsSync(f)) continue;
+    const lines = fs.readFileSync(f, "utf8").split(/\r?\n/);
+    const starts = lines.map((l, i) => (l.trim() === START ? i : -1)).filter((i) => i >= 0);
+    const ends = lines.map((l, i) => (l.trim() === END ? i : -1)).filter((i) => i >= 0);
+    if (starts.length === 0 && ends.length === 0) continue;
+    if (starts.length === 1 && ends.length === 1 && starts[0] < ends[0]) hasMarker = true;
+    else broken.push(base);
+  }
   const wired = hasConfig || hasMarker;
 
   const stateFile = path.join(root, ".claude", "state", "codex-dispatch.json");
@@ -54,9 +65,13 @@ try {
         "- 同一 bug 修 2 次失敗 → 交 Codex 救援（唯讀診斷）。小改動不送審。",
         "- Codex 失敗絕不阻塞：審 diff 失敗記入未審清單、繼續；審計畫/救援失敗詢問使用者。收工前補審或逐項標記。",
         "- 完整規則與指令：先載入 Skill `codex-dispatch:dispatch` 再動工。",
-        pending ? `- ⚠ 未審清單有 ${pending} 筆待補審（收工前處理）。` : null
+        pending ? `- ⚠ 未審清單有 ${pending} 筆待補審（收工前處理）。` : null,
+        broken.length ? `- ⚠ ${broken.join("、")} 的 codex-dispatch 標記段損壞（start/end 不成對或順序反），setup/uninstall 會拒絕動它；請手動修正。` : null
       ].filter(Boolean)
-    : ["[codex-dispatch] 已安裝但本專案尚未接線；需要 Codex 審查流程時執行 /codex-dispatch:setup。"];
+    : [
+        "[codex-dispatch] 已安裝但本專案尚未接線；需要 Codex 審查流程時執行 /codex-dispatch:setup。",
+        broken.length ? `⚠ ${broken.join("、")} 含損壞的 codex-dispatch 標記段（start/end 不成對或順序反），請先手動修正再 setup。` : null
+      ].filter(Boolean);
 
   out({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: lines.join("\n") } });
 } catch {
