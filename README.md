@@ -17,7 +17,7 @@ Claude Code plugin：**「Claude 寫、Codex 審」的調度規則**。
 - **Codex 掛了還有第二道**：額度用完時 Claude 開一個獨立的唯讀 subagent 自審（同一套 JSON schema、對抗式 prompt），結果照規則處理，但仍標記「未經 Codex 審查」等額度恢復補審。
 - **護欄寫在程式裡，不靠 Claude 自律**：審查輪次上限（CLI 原子強制、多視窗安全）、疑似機密檔擋送（含 rename 繞過）、未審清單不自動消失（只標 STALE）、反接線先預覽再動手。
 - **只審不寫**：Codex 額度花在最值得的地方——審計畫、審 diff、找根因；連救援都預設唯讀，由 Claude 套用建議。Plus 方案的 5 小時窗口撐得住。
-- **自己審自己長大**：本 repo 從第一行就走這套流程。v0.1 到 v0.1.2 共 10 輪審查（Codex 9 輪 + Claude 自審 1 輪），抓出 20+ 個 HIGH——路徑逃逸、`--retries Infinity`、TOML 寫壞、rename 繞過機密閘門、輪次計數競態、TOCTOU symlink、沒 commit 的專案變終身上限……每一條都在 `plans/` 的審查紀錄裡。
+- **自己審自己長大**：本 repo 從第一行就走這套流程。v0.1 到 v0.1.3 共 13 輪審查（Codex 12 輪 + Claude 自審 1 輪），抓出近 30 個 HIGH——路徑逃逸、`--retries Infinity`、TOML 寫壞、rename 繞過機密閘門、輪次計數競態、TOCTOU symlink、沒 commit 的專案變終身上限……每一條都在 `plans/` 的審查紀錄裡。
 
 ## 它做什麼
 
