@@ -126,10 +126,13 @@ export function withLock(root, fn) {
         continue; // 鎖剛被釋放，立刻重試
       }
       if (age > LOCK_STALE_MS) {
+        // 清 stale 鎖用 rename（原子）：多個程序同時發現 stale，只有一個 rename 成功，其餘 ENOENT 重試
+        const graveyard = `${lock}.stale.${process.pid}.${crypto.randomBytes(4).toString("hex")}`;
         try {
-          fs.unlinkSync(lock);
+          fs.renameSync(lock, graveyard);
+          fs.unlinkSync(graveyard);
         } catch {
-          /* 別人先清了 */
+          /* 別人先搬走了 */
         }
         continue;
       }
@@ -145,11 +148,14 @@ export function withLock(root, fn) {
     } catch {
       /* ignore */
     }
-    // 鎖若已被別人判定 stale 而搶走，鎖檔內容就不是我們的 token → 不能刪別人的鎖
+    // 釋放：先 rename 到私有名稱（原子，別人搶走並重建的鎖不會被我們碰到），再驗 token；不是我們的就 rename 回去
+    const mine = `${lock}.rel.${process.pid}.${crypto.randomBytes(4).toString("hex")}`;
     try {
-      if (fs.readFileSync(lock, "utf8").startsWith(`${token} `)) fs.unlinkSync(lock);
+      fs.renameSync(lock, mine);
+      if (fs.readFileSync(mine, "utf8").startsWith(`${token} `)) fs.unlinkSync(mine);
+      else fs.renameSync(mine, lock); // 那是別人的（我們的已被判定 stale 搬走）→ 還回去
     } catch {
-      /* ignore */
+      /* 鎖已不存在 */
     }
   }
 }
