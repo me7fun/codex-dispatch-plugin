@@ -211,6 +211,9 @@ async function quotaFor(cfg) {
 }
 
 function quotaMessage(q) {
+  if (q.status === "unknown" && /token_expired|401 Unauthorized/.test(q.error || "")) {
+    return "Codex 額度 unknown：登入 token 已過期，請在終端機執行 codex logout 再 codex login";
+  }
   const pct = typeof q.usedPercent === "number" ? `${q.usedPercent}%` : "?";
   const reset = q.resetsAt ? `，重置 ${q.resetsAt}` : "";
   const plan = q.planType ? `（${q.planType}）` : "";
@@ -695,11 +698,21 @@ async function cmdPreflight(argv) {
   checks.push({ name: "windowsSandbox", required: true, ...ws });
 
   const q = await quotaFor(cfg);
+  const tokenExpired = q.status === "unknown" && /token_expired|401 Unauthorized/.test(q.error || "");
+  if (tokenExpired) {
+    // codex login status 會說已登入，但後端已拒絕 token（升級方案、久未使用都會發生）
+    const auth = checks.find((c) => c.name === "codexAuth");
+    if (auth) {
+      auth.status = "fail";
+      auth.detail = "登入 token 已過期（後端回 401 token_expired），雖然 codex login status 顯示已登入";
+      auth.fix = "在終端機執行：codex logout 然後 codex login";
+    }
+  }
   checks.push({
     name: "quota",
     required: false,
     status: q.status === "exhausted" ? "warn" : q.status === "unknown" ? "warn" : "ok",
-    detail: quotaMessage(q)
+    detail: tokenExpired ? "查詢失敗：token 過期（見 codexAuth）" : quotaMessage(q)
   });
 
   checks.push({ name: "config", required: false, status: warning ? "warn" : "ok", detail: warning ?? `${source === "defaults" ? "使用預設值" : source}` });
