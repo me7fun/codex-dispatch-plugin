@@ -40,7 +40,7 @@ Claude Code plugin：**「Claude 寫、Codex 審」的調度規則**。
    /plugin install codex@openai-codex
    ```
    **不要**開啟它的 review gate（撞限額會無限迴圈）。
-4. 目標專案是 git repo（本機 `git init` 即可，不需 commit 或 remote；Codex review 靠 git diff 定義「改了什麼」）
+4. 目標專案是 git repo（本機 `git init` 即可，不需 commit 或 remote；Codex review 靠 git diff 定義「改了什麼」）。**submodule／多 repo 佈局**：專案根是「改動所在的 repo」，Claude 會帶 `--cwd <該目錄>`；從上層 repo 送審只看得到子模組指標，CLI 會拒絕並提示。各 repo 的 state／輪次獨立，多視窗同時開發不同 repo 互不影響。
 5. **Windows 必做**：`~/.codex/config.toml` 加入
    ```toml
    [windows]

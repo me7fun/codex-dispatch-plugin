@@ -32,7 +32,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { projectRoot, gitTopLevel, gitHeadSha, gitChangedPathsForGate, gitDiffPathsForGate, codexHomeDir } from "./lib/paths.mjs";
+import { projectRoot, gitTopLevel, gitHeadSha, gitChangedPathsForGate, gitDiffPathsForGate, gitSubmodulePaths, codexHomeDir } from "./lib/paths.mjs";
 import { resolveCompanion, runCompanion, parseJsonLoose, tailLines } from "./lib/companion.mjs";
 import { readQuota } from "./lib/quota.mjs";
 import { loadConfig, CONFIG_REL, DEFAULTS } from "./lib/config.mjs";
@@ -405,12 +405,28 @@ async function cmdReview(argv) {
   const { config: cfg } = loadConfig(root);
   const mode = options.adversarial || options.strict ? "adversarial" : options.native ? "native" : cfg.reviewMode;
   const strict = Boolean(options.strict); // 全對抗、不校準：只給「嚴格審查」用，且只跑一次
+  let result_note_subs = null; // 這次 diff 裡混有 submodule 指標變更（其內容不會被審）
   const userFocus = positionals.join(" ").trim();
   const focus = mode === "adversarial" && !strict ? `${calibrationText(cfg.confidenceThreshold)}\n${userFocus || "Implementation defects and correctness of the change."}` : userFocus;
   if (!gitTopLevel(root)) return emit(localError("review", `${root} 不是 git repo；Codex review 依賴 git diff，請先 git init`), options.json, renderReview);
   const retries = parseRetries(options.retries);
   if (retries === null) return emit(localError("review", `--retries 必須是 0..${MAX_RETRIES} 的整數`), options.json, renderReview);
   const target = reviewPaths(root, { base: options.base, scope: options.scope });
+  // submodule 佈局：在上層 repo 送審時 git 只看到「子模組指標變了」，Codex 看不到裡面的檔案 → 拒絕並提示 --cwd
+  const subs = gitSubmodulePaths(root);
+  if (subs.length) {
+    const norm = (p) => p.replace(/\\/g, "/").replace(/\/$/, "");
+    const touchedSubs = target.paths.map(norm).filter((p) => subs.map(norm).includes(p));
+    const onlySubs = target.paths.length > 0 && touchedSubs.length === target.paths.length;
+    if (onlySubs) {
+      return emit(
+        localError("review", `改動都在 submodule 內（${touchedSubs.join(", ")}），從上層 repo 只看得到指標變更；請改用 --cwd <submodule 目錄> 在該 repo 內送審`, { submodules: touchedSubs }),
+        options.json,
+        renderReview
+      );
+    }
+    if (touchedSubs.length) result_note_subs = touchedSubs;
+  }
   if (!target.resolved) {
     const why = options.base
       ? `--base ${options.base} 無法取得 diff（ref 不存在或與 HEAD 沒有共同祖先）`
@@ -475,6 +491,7 @@ async function cmdReview(argv) {
     result.cycleReset = completeRound(root, cycleKey, reserved.reservationId, { approve: result.ok && result.verdict === "approve" });
   }
   if (userFocus && mode === "native") result.note = "native review 不支援 focus 文字，已忽略；要帶 focus 請用 --adversarial";
+  if (result_note_subs) result.submodulesSkipped = result_note_subs; // 提醒：這些 submodule 內的改動沒被審，要另外 --cwd 進去審
   emit(result, options.json, renderReview);
 }
 
@@ -1118,7 +1135,7 @@ function renderFailure(r) {
 
 function renderReview(r) {
   if (!r.ok) return renderFailure(r);
-  const head = `# Codex ${r.kind}${r.mode ? ` (${r.mode})` : ""}\nTarget: ${r.target?.label ?? "?"}${r.round ? `\nRound: ${r.round}/${r.maxRounds}` : ""}${r.quota ? `\n${quotaMessage(r.quota)}` : ""}\n`;
+  const head = `# Codex ${r.kind}${r.mode ? ` (${r.mode})` : ""}\nTarget: ${r.target?.label ?? "?"}${r.round ? `\nRound: ${r.round}/${r.maxRounds}` : ""}${r.quota ? `\n${quotaMessage(r.quota)}` : ""}${r.submodulesSkipped ? `\n⚠ 未審到 submodule 內的改動：${r.submodulesSkipped.join(", ")}（請 --cwd 進該 repo 另外送審）` : ""}\n`;
   if (r.verdict === null || r.verdict === undefined) return `${head}\n${r.raw ?? ""}\n${r.note ? `\n（${r.note}）\n` : ""}`;
   const low = r.lowConfidence?.length ? `\n## Low confidence (< ${r.confidenceThreshold}，只供參考、不自動修)\n${renderFindings(r.lowConfidence)}` : "";
   return `${head}${r.strict ? "Mode: strict adversarial（未校準，只跑一次）\n" : ""}\nVerdict: ${r.verdict}\n${r.summary ? `${r.summary}\n` : ""}\n## Findings\n${renderFindings(r.findings)}${low}${r.nextSteps?.length ? `\n## Next steps\n${r.nextSteps.map((s) => `- ${s}`).join("\n")}\n` : ""}`;

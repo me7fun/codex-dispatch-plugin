@@ -70,9 +70,26 @@ export function gitDiffPathsForGate(cwd, ref) {
   return out;
 }
 
-/** 專案根：CLAUDE_PROJECT_DIR → git 根 → cwd */
+/**
+ * 專案根：cwd 所在的 git 根 → CLAUDE_PROJECT_DIR → cwd。
+ * git 根優先：submodule／多 repo 佈局下，cwd 在 game1/ 時專案根必須是 game1（自己的 HEAD、diff、state），
+ * 不能因為 Claude Code 的 CLAUDE_PROJECT_DIR 指著上層 client 根就被帶走。
+ */
 export function projectRoot(cwd = process.cwd()) {
+  const top = gitTopLevel(cwd);
+  if (top) return top;
   const env = process.env.CLAUDE_PROJECT_DIR;
   if (env && fs.existsSync(env)) return path.resolve(env);
-  return gitTopLevel(cwd) || path.resolve(cwd);
+  return path.resolve(cwd);
+}
+
+/** 目前 repo 直接掛載的 submodule 路徑（相對 repo 根）；不是 git repo 或沒有 submodule 回 [] */
+export function gitSubmodulePaths(cwd) {
+  const r = spawnSync("git", ["config", "--file", ".gitmodules", "--get-regexp", "^submodule\\..*\\.path$"], { cwd, encoding: "utf8", windowsHide: true });
+  if (r.status !== 0) return [];
+  return r.stdout
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((l) => l.split(/\s+/).slice(1).join(" ").trim())
+    .filter(Boolean);
 }
