@@ -15,8 +15,14 @@ const STALE_HOURS = 24;
 /** 輪次計數超過這麼久沒動就自動清除（沒有任務會跑一週還在同一批改動上） */
 const ROUNDS_TTL_DAYS = 7;
 
+/**
+ * 進行中的佔用超過這麼久視為程序已死。
+ * 一次 review 最多 4 次嘗試（1 + MAX_RETRIES=3），每次 companion 逾時 15 分鐘 → 上限 60 分鐘，取 2 小時留餘裕。
+ */
+const ACTIVE_STALE_MS = 2 * 60 * 60 * 1000;
+
 function empty() {
-  return { version: VERSION, unreviewed: [], rounds: {}, roundsAt: {}, updatedAt: null };
+  return { version: VERSION, unreviewed: [], rounds: {}, roundsAt: {}, roundsActive: {}, updatedAt: null };
 }
 
 function touchRound(st, key) {
@@ -26,6 +32,12 @@ function touchRound(st, key) {
 function dropRound(st, key) {
   delete st.rounds[key];
   delete st.roundsAt[key];
+  delete st.roundsActive[key];
+}
+
+function activeIds(st, key) {
+  const map = st.roundsActive[key];
+  return map && typeof map === "object" ? Object.keys(map) : [];
 }
 
 export function stateFile(root) {
@@ -46,6 +58,7 @@ export function loadState(root, { staleHours = STALE_HOURS } = {}) {
   if (!Array.isArray(st.unreviewed)) st.unreviewed = [];
   if (!st.rounds || typeof st.rounds !== "object") st.rounds = {};
   if (!st.roundsAt || typeof st.roundsAt !== "object") st.roundsAt = {};
+  if (!st.roundsActive || typeof st.roundsActive !== "object") st.roundsActive = {};
   // 輪次計數過期清理：沒時間戳的舊資料視為現在起算
   const roundsCutoff = Date.now() - ROUNDS_TTL_DAYS * 24 * 3600 * 1000;
   st.roundsPruned = 0;
@@ -57,6 +70,24 @@ export function loadState(root, { staleHours = STALE_HOURS } = {}) {
     }
   }
   for (const key of Object.keys(st.roundsAt)) if (!(key in st.rounds)) delete st.roundsAt[key];
+  // 進行中佔用：程序死掉沒釋放的（超過 ACTIVE_STALE_MS）清掉
+  const activeCutoff = Date.now() - ACTIVE_STALE_MS;
+  for (const key of Object.keys(st.roundsActive)) {
+    const map = st.roundsActive[key];
+    if (!map || typeof map !== "object" || !(key in st.rounds)) {
+      delete st.roundsActive[key];
+      continue;
+    }
+    for (const id of Object.keys(map)) {
+      if (Date.parse(map[id]) < activeCutoff) {
+        // 程序死掉沒釋放：把它佔的那一輪退回去，否則會一直佔著 maxRounds 直到 7 天 TTL
+        delete map[id];
+        if (st.rounds[key] > 0) st.rounds[key] -= 1;
+      }
+    }
+    if (Object.keys(map).length === 0) delete st.roundsActive[key];
+    if (!st.rounds[key]) dropRound(st, key);
+  }
   const cutoff = Date.now() - staleHours * 3600 * 1000;
   st.unreviewed = st.unreviewed.map((e) => ({ ...e, stale: Date.parse(e.createdAt || 0) < cutoff }));
   st.staleCount = st.unreviewed.filter((e) => e.stale).length;
@@ -168,44 +199,62 @@ export function clearUnreviewed(root, ids = null) {
 }
 
 /**
- * 原子地「檢查上限並佔用一輪」：在同一把鎖內讀 count、比較、遞增。
- * 回 {ok:true, round} 或 {ok:false, used}——兩個 session 同時在 max-1 也只會有一個成功。
+ * 原子地「檢查上限並佔用一輪」：在同一把鎖內讀 count、比較、遞增，並登記一個本次專屬的 reservationId。
+ * 回 {ok:true, round, reservationId} 或 {ok:false, used}——兩個 session 同時在 max-1 也只會有一個成功。
  */
 export function reserveRound(root, key, max) {
   return withLock(root, () => {
     const st = loadState(root);
     const used = st.rounds[key] || 0;
     if (used >= max) return { ok: false, used };
+    const reservationId = crypto.randomBytes(6).toString("hex");
     st.rounds[key] = used + 1;
+    if (!st.roundsActive[key]) st.roundsActive[key] = {};
+    st.roundsActive[key][reservationId] = new Date().toISOString();
     touchRound(st, key);
     saveState(root, st);
-    return { ok: true, round: used + 1 };
+    return { ok: true, round: used + 1, reservationId };
   });
 }
 
 /**
- * approve 後結束 cycle——但只在「沒有別的 session 在我之後佔用」時清計數（count === 我的 round）。
- * 這樣多視窗同時審時不會清掉別人的佔用；沒 commit 的專案也不會累積成終身上限。
- * 回 true 表示已清。
+ * 審查完成：只移除自己的 reservationId。approve 且**沒有任何其他進行中的佔用**才清整個 cycle。
+ * 別的 session 還在審 → 只解除自己的登記，計數保留；它們完成時再判斷。
+ * 回 true 表示 cycle 已清。
  */
-export function resetRoundIfLast(root, key, round) {
+export function completeRound(root, key, reservationId, { approve = false } = {}) {
   return withLock(root, () => {
     const st = loadState(root);
-    if ((st.rounds[key] || 0) !== round) return false;
-    dropRound(st, key);
+    if (st.roundsActive[key]) delete st.roundsActive[key][reservationId];
+    const othersActive = activeIds(st, key).length > 0;
+    if (approve && !othersActive) {
+      dropRound(st, key);
+      saveState(root, st);
+      return true;
+    }
+    if (st.roundsActive[key] && Object.keys(st.roundsActive[key]).length === 0) delete st.roundsActive[key];
     saveState(root, st);
-    return true;
+    return false;
   });
 }
 
-/** 退回一輪（例如額度不足／本地錯誤，Codex 根本沒跑） */
-export function releaseRound(root, key) {
-  withLock(root, () => {
+/**
+ * 退回一輪（例如額度不足／本地錯誤，Codex 根本沒跑）：只退自己的那一次。
+ * 自己的 reservationId 已不存在（被判定 stale 清掉、或 cycle 已被 approve 清除）→ 冪等 no-op，不動別人的計數。回 true 表示有退。
+ */
+export function releaseRound(root, key, reservationId) {
+  return withLock(root, () => {
     const st = loadState(root);
+    if (!st.roundsActive[key] || !(reservationId in st.roundsActive[key])) return false;
+    delete st.roundsActive[key][reservationId];
     if (st.rounds[key] > 0) st.rounds[key] -= 1;
     if (!st.rounds[key]) dropRound(st, key);
-    else touchRound(st, key);
+    else {
+      touchRound(st, key);
+      if (st.roundsActive[key] && Object.keys(st.roundsActive[key]).length === 0) delete st.roundsActive[key];
+    }
     saveState(root, st);
+    return true;
   });
 }
 
@@ -225,16 +274,6 @@ export function purgeState(root) {
       }
     }
     return removed;
-  });
-}
-
-export function bumpRound(root, key) {
-  return withLock(root, () => {
-    const st = loadState(root);
-    st.rounds[key] = (st.rounds[key] || 0) + 1;
-    touchRound(st, key);
-    saveState(root, st);
-    return st.rounds[key];
   });
 }
 

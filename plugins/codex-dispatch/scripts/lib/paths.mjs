@@ -51,10 +51,10 @@ export function gitChangedPathsForGate(cwd) {
   return out;
 }
 
-/** base...HEAD 的 diff 路徑，rename/copy 含新舊路徑 */
+/** base...HEAD 的 diff 路徑，rename/copy 含新舊路徑。git 失敗（ref 無效、無 merge base）回 null，呼叫端必須 fail-closed。 */
 export function gitDiffPathsForGate(cwd, ref) {
   const r = spawnSync("git", ["diff", "--name-status", "-z", `${ref}...HEAD`], { cwd, encoding: "utf8", windowsHide: true });
-  if (r.status !== 0) return [];
+  if (r.status !== 0) return null;
   const fields = r.stdout.split("\0");
   const out = [];
   for (let i = 0; i < fields.length; i += 1) {

@@ -32,7 +32,7 @@ import { projectRoot, gitTopLevel, gitHeadSha, gitChangedPathsForGate, gitDiffPa
 import { resolveCompanion, runCompanion, parseJsonLoose, tailLines } from "./lib/companion.mjs";
 import { readQuota } from "./lib/quota.mjs";
 import { loadConfig, CONFIG_REL, DEFAULTS } from "./lib/config.mjs";
-import { loadState, addUnreviewed, clearUnreviewed, reserveRound, releaseRound, resetRounds, resetRoundIfLast, purgeState, stateFile } from "./lib/state.mjs";
+import { loadState, addUnreviewed, clearUnreviewed, reserveRound, releaseRound, resetRounds, completeRound, purgeState, stateFile } from "./lib/state.mjs";
 
 const SEVERITIES = ["critical", "high", "medium", "low"];
 const VERDICTS = ["approve", "needs-attention"];
@@ -174,10 +174,11 @@ function reviewPaths(root, { base, scope }) {
         }
       }
     }
-    if (ref) gitDiffPathsForGate(root, ref).forEach((p) => set.add(p));
-    else resolved = false;
+    const diffPaths = ref ? gitDiffPathsForGate(root, ref) : null;
+    if (diffPaths) diffPaths.forEach((p) => set.add(p));
+    else resolved = false; // 沒有候選 base、ref 無效、或沒有 merge base → 無法列舉，fail-closed
   }
-  return { paths: [...set], resolved };
+  return { paths: [...set], resolved, ref: wantBranch ? (base || null) : null };
 }
 
 /** 統一的機密閘門：所有會把內容送到 Codex 的指令都必須先過。回 null 表示可送。 */
@@ -374,7 +375,10 @@ async function cmdReview(argv) {
   if (retries === null) return emit(localError("review", `--retries 必須是 0..${MAX_RETRIES} 的整數`), options.json, renderReview);
   const target = reviewPaths(root, { base: options.base, scope: options.scope });
   if (!target.resolved) {
-    return emit(localError("review", "--scope branch 找不到基準分支（只認 main/master/origin/main/origin/master），機密閘門無法列舉 diff；請明確指定 --base <ref>"), options.json, renderReview);
+    const why = options.base
+      ? `--base ${options.base} 無法取得 diff（ref 不存在或與 HEAD 沒有共同祖先）`
+      : "--scope branch 找不到基準分支（只認 main/master/origin/main/origin/master）";
+    return emit(localError("review", `${why}；機密閘門無法列舉 diff，拒絕送審。請確認 ref 或明確指定 --base <ref>`), options.json, renderReview);
   }
   const gate = secretGate(target.paths, options["allow-secrets"]);
   if (gate) return emit(localError("review", gate), options.json, renderReview);
@@ -411,13 +415,14 @@ async function cmdReview(argv) {
   result.round = round;
   result.maxRounds = cfg.maxRounds;
   result.cycleKey = cycleKey;
-  // approve 結束 cycle：只在沒有其他 session 在我之後佔用時清計數（否則會清掉別人的）；沒 commit 的專案靠這條開新輪
-  if (result.ok && result.verdict === "approve") result.cycleReset = resetRoundIfLast(root, cycleKey, round);
   if (!result.ok && (result.reason === "quota" || result.reason === "local-error")) {
-    // Codex 根本沒跑（額度不足／本地錯誤）→ 退回這一輪，額度恢復後不會被 maxRounds 擋住
-    releaseRound(root, cycleKey);
+    // Codex 根本沒跑（額度不足／本地錯誤）→ 退回自己這一次佔用，額度恢復後不會被 maxRounds 擋住
+    releaseRound(root, cycleKey, reserved.reservationId);
     result.round = round - 1;
     result.roundReleased = true;
+  } else {
+    // 完成：解除自己的登記；approve 且沒有其他 session 進行中才清整個 cycle（沒 commit 的專案靠這條開新輪）
+    result.cycleReset = completeRound(root, cycleKey, reserved.reservationId, { approve: result.ok && result.verdict === "approve" });
   }
   if (focus && mode === "native") result.note = "native review 不支援 focus 文字，已忽略；要帶 focus 請用 --adversarial";
   emit(result, options.json, renderReview);
@@ -838,16 +843,19 @@ function cmdUnwire(argv) {
     if (err) return fail(err);
   }
 
-  let claudePlan = null; // {mode:"delete"|"modify", remaining, loc}
+  let claudePlan = null; // {mode:"delete"|"modify", remaining, loc, hash}
+  const sha = (text) => crypto.createHash("sha256").update(text).digest("hex");
   if (fs.existsSync(claudeMd)) {
-    const lines = fs.readFileSync(claudeMd, "utf8").split(/\r?\n/);
+    const original = fs.readFileSync(claudeMd, "utf8");
+    const lines = original.split(/\r?\n/);
     const loc = locateSnippet(lines);
     if (loc.error) return fail(`${claudeMd}：${loc.error}`);
     if (!loc.absent) {
       const rest = [...lines.slice(0, loc.start), ...lines.slice(loc.end + 1)];
       while (rest.length && rest[rest.length - 1].trim() === "") rest.pop();
       const remaining = rest.join("\n");
-      claudePlan = remaining.trim() === "" ? { mode: "delete", loc } : { mode: "modify", loc, remaining, kept: rest.length };
+      const hash = sha(original); // 執行前重讀比對，避免用過期快照蓋掉別人剛改的內容
+      claudePlan = remaining.trim() === "" ? { mode: "delete", loc, hash } : { mode: "modify", loc, remaining, kept: rest.length, hash };
     }
   }
 
@@ -880,6 +888,17 @@ function cmdUnwire(argv) {
       const err = unsafePath(root, file);
       if (err) throw new Error(err);
     };
+    // 外部編輯器不會配合我們的鎖，雜湊檢查與 rename 之間永遠有空隙 → 動手前先備份到 state 目錄，撞到也找得回來
+    const backupDir = path.dirname(stateFile(root));
+    const guardClaudeMd = () => {
+      guard(claudeMd);
+      const current = fs.readFileSync(claudeMd, "utf8");
+      if (sha(current) !== claudePlan.hash) throw new Error(`${claudeMd} 在預覽之後被修改過，為避免蓋掉新內容而中止；請重新執行 unwire`);
+      fs.mkdirSync(backupDir, { recursive: true });
+      const backup = path.join(backupDir, `CLAUDE.md.${new Date().toISOString().replace(/[:.]/g, "-")}.bak`);
+      fs.writeFileSync(backup, current, "utf8");
+      warnings.push(`已備份原 CLAUDE.md → ${backup}`);
+    };
     try {
       if (purgeStateWanted) {
         for (const p of statePaths) guard(p);
@@ -892,12 +911,12 @@ function cmdUnwire(argv) {
         mark(cfgFile, "done");
       }
       if (claudePlan?.mode === "delete") {
-        guard(claudeMd);
+        guardClaudeMd();
         fs.unlinkSync(claudeMd); // unlink 不跟隨 symlink
         mark(claudeMd, "done");
       }
       if (claudePlan?.mode === "modify") {
-        guard(claudeMd);
+        guardClaudeMd();
         // 寫暫存檔再 rename：rename 取代的是目標本身，不會跟隨 symlink 寫到別處
         const tmp = `${claudeMd}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
         fs.writeFileSync(tmp, `${claudePlan.remaining}\n`, "utf8");
