@@ -34,7 +34,7 @@ import { projectRoot, gitTopLevel, gitHeadSha, gitChangedPathsForGate, gitDiffPa
 import { resolveCompanion, runCompanion, parseJsonLoose, tailLines } from "./lib/companion.mjs";
 import { readQuota } from "./lib/quota.mjs";
 import { loadConfig, CONFIG_REL, DEFAULTS } from "./lib/config.mjs";
-import { loadState, addUnreviewed, clearUnreviewed, reserveRound, releaseRound, resetRounds, completeRound, purgeState, stateFile, withLock } from "./lib/state.mjs";
+import { loadState, addUnreviewed, clearUnreviewed, reserveRound, releaseRound, resetRounds, completeRound, purgeState, stateFile, withLock, lockStillOwned } from "./lib/state.mjs";
 
 const SEVERITIES = ["critical", "high", "medium", "low"];
 const VERDICTS = ["approve", "needs-attention"];
@@ -798,8 +798,10 @@ function scanSnippetTargets(root) {
 function gitIgnoreStatus(root, rel) {
   const inRepo = Boolean(gitTopLevel(root));
   if (!inRepo) return { git: false };
-  const tracked = spawnSync("git", ["ls-files", "--error-unmatch", "--", rel], { cwd: root, encoding: "utf8", windowsHide: true }).status === 0;
-  const ignored = spawnSync("git", ["check-ignore", "-q", "--", rel], { cwd: root, encoding: "utf8", windowsHide: true }).status === 0;
+  // 在鎖內呼叫：加 timeout，避免 git 卡住讓鎖被判定 stale 而被搶走
+  const opts = { cwd: root, encoding: "utf8", windowsHide: true, timeout: 5000 };
+  const tracked = spawnSync("git", ["ls-files", "--error-unmatch", "--", rel], opts).status === 0;
+  const ignored = spawnSync("git", ["check-ignore", "-q", "--", rel], opts).status === 0;
   return { git: true, tracked, ignored };
 }
 
@@ -862,7 +864,10 @@ function cmdSnippet(argv) {
       const tmp = `${target.file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
       try {
         fs.writeFileSync(tmp, next, "utf8");
-        // rename 前最後一次確認目標沒在掃描後被改（鎖擋得住我們自己，擋不住外部編輯器）
+        // rename 前最後一次確認：鎖仍是我的、另一檔沒在這期間被接線、目標沒被外部編輯器改過
+        if (!lockStillOwned(root)) throw new Error("專案鎖在寫入前被其他程序接手（可能是本程序停頓過久），為安全起見中止；請重新執行");
+        const other = scanSnippetTargets(root).find((s) => s.name !== targetName);
+        if (other && other.state === "valid") throw new Error(`${path.basename(other.file)} 在掃描之後被接線，為避免雙重接線而中止；請重新執行`);
         const nowText = fs.existsSync(target.file) ? fs.readFileSync(target.file, "utf8") : null;
         if ((target.text ?? null) !== nowText) throw new Error(`${target.file} 在掃描之後被修改，為避免蓋掉新內容而中止；請重新執行`);
         fs.renameSync(tmp, target.file);

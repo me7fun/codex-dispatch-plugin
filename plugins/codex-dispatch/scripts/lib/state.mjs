@@ -94,7 +94,7 @@ export function loadState(root, { staleHours = STALE_HOURS } = {}) {
   return st;
 }
 
-const LOCK_STALE_MS = 30_000;
+const LOCK_STALE_MS = 60_000; // 持鎖內的操作都應在幾秒內完成；超過視為程序已死
 const LOCK_WAIT_MS = 5_000;
 
 function sleepSync(ms) {
@@ -110,11 +110,12 @@ export function withLock(root, fn) {
   const lock = `${stateFile(root)}.lock`;
   fs.mkdirSync(path.dirname(lock), { recursive: true });
   const deadline = Date.now() + LOCK_WAIT_MS;
+  const token = `${process.pid}:${crypto.randomBytes(6).toString("hex")}`; // 擁有者 token：釋放時只刪自己的鎖
   let fd = null;
   for (;;) {
     try {
       fd = fs.openSync(lock, "wx");
-      fs.writeSync(fd, `${process.pid} ${new Date().toISOString()}\n`);
+      fs.writeSync(fd, `${token} ${new Date().toISOString()}\n`);
       break;
     } catch (err) {
       if (err.code !== "EEXIST") throw err;
@@ -144,11 +145,23 @@ export function withLock(root, fn) {
     } catch {
       /* ignore */
     }
+    // 鎖若已被別人判定 stale 而搶走，鎖檔內容就不是我們的 token → 不能刪別人的鎖
     try {
-      fs.unlinkSync(lock);
+      if (fs.readFileSync(lock, "utf8").startsWith(`${token} `)) fs.unlinkSync(lock);
     } catch {
       /* ignore */
     }
+  }
+}
+
+/** 呼叫端可用來確認自己仍持有鎖（被搶走則回 false）。fn 內部長操作後、破壞性動作前使用。 */
+export function lockStillOwned(root) {
+  const lock = `${stateFile(root)}.lock`;
+  try {
+    const owner = fs.readFileSync(lock, "utf8").split(" ")[0];
+    return owner.startsWith(`${process.pid}:`);
+  } catch {
+    return false;
   }
 }
 
