@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { findConfigRoot } from "./paths.mjs";
 
 export const CONFIG_REL = path.join(".claude", "codex-dispatch.config.json");
 
@@ -25,9 +26,13 @@ function pickInt(v, def, min = 0) {
   return Number.isInteger(v) && v >= min ? v : def;
 }
 
-/** 讀 <root>/.claude/codex-dispatch.config.json；缺檔/壞檔/壞值一律回落預設（fail-soft）。 */
+/**
+ * 讀設定：以 reviewRoot 往上找到的規則根（configRoot）為準——submodule 佈局下規則在上層 client 根。
+ * 缺檔/壞檔/壞值一律回落預設（fail-soft）。
+ */
 export function loadConfig(root) {
-  const file = path.join(root, CONFIG_REL);
+  const configRoot = findConfigRoot(root);
+  const file = path.join(configRoot, CONFIG_REL);
   let raw = {};
   let source = "defaults";
   let warning = null;
@@ -55,5 +60,5 @@ export function loadConfig(root) {
         ? raw.confidenceThreshold
         : DEFAULTS.confidenceThreshold
   };
-  return { config, source, warning };
+  return { config, source, warning, configRoot };
 }

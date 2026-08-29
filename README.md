@@ -40,7 +40,13 @@ Claude Code plugin：**「Claude 寫、Codex 審」的調度規則**。
    /plugin install codex@openai-codex
    ```
    **不要**開啟它的 review gate（撞限額會無限迴圈）。
-4. 目標專案是 git repo（本機 `git init` 即可，不需 commit 或 remote；Codex review 靠 git diff 定義「改了什麼」）。**submodule／多 repo 佈局**：專案根是「改動所在的 repo」，Claude 會帶 `--cwd <該目錄>`；從上層 repo 送審只看得到子模組指標，CLI 會拒絕並提示。各 repo 的 state／輪次獨立，多視窗同時開發不同 repo 互不影響。
+4. 目標專案是 git repo（本機 `git init` 即可，不需 commit 或 remote；Codex review 靠 git diff 定義「改了什麼」）。
+
+**submodule／多 repo 佈局**（規則在上層 client 根、改動在 `games/<game>/` 各自的 repo）原生支援，用雙根：
+- **審查根** = 改動所在的 repo：diff、HEAD、審查輪次以它為準。Claude 帶 `--cwd games/<game>` 即可。
+- **規則根** = 從審查根往上找到的已接線目錄：設定檔、CLAUDE.md 規則、`plans/`、以及**所有 sub-repo 的 state** 都在這（`.claude/state/codex-dispatch/<game>-<hash>.json`，game repo 裡不留任何檔）。
+- 從上層 repo 送審只看得到子模組指標 → CLI 拒絕並提示 `--cwd`；未初始化的 submodule → 提示 `git submodule update --init`。
+- 各 game 的輪次、未審清單獨立，多視窗同時開發不同 game 互不影響；在規則根 `/codex-dispatch:status` 會列出全部。
 5. **Windows 必做**：`~/.codex/config.toml` 加入
    ```toml
    [windows]

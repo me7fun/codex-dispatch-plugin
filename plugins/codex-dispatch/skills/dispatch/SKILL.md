@@ -26,7 +26,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/dispatch.mjs" <子指令> --json ...
    b. `plan-review <planDir>/<slug>.md --json`。採納合理意見修訂計畫（在計畫尾端記一行審查紀錄），再開始實作。
 2. 實作完成（尚未 commit）：`review --json`（預設 adversarial 模式＋內建嚴重度校準：HIGH 只算單人正常操作會碰到的缺陷，多 session／極端時序最高 MEDIUM，confidence 低於門檻的另列 `lowConfidence` 不自動修，沒有 HIGH 就 approve）。
    - 送審範圍是整個 working tree：若 `git status` 顯示有**不是我這次改的**未提交變更，先告知使用者「這些會一起被審」；要只審某段就用 `--base <ref>`／`--scope branch`。
-   - **submodule／多 repo 佈局**（例如 client 根下每個 game 是自己的 repo）：專案根＝**改動所在的那個 repo**，一律加 `--cwd <該 repo 目錄>`（review、plan-review、state 都是）。從上層 repo 送審 git 只看到子模組指標變了，CLI 會拒絕並提示；結果若出現 `submodulesSkipped`，代表那些目錄的改動沒被審，要各自再送一次。不同 game 的 state、輪次、未審清單各自獨立，多視窗同時開發互不影響。
+   - **submodule／多 repo 佈局**（例如 client 根下 `games/<game>/` 各是自己的 repo，而規則、plans/、設定都在 client 根）：CLI 用**雙根**——**審查根**＝改動所在的 repo（diff、HEAD、輪次以它為準），**規則根**＝從審查根往上找到的已接線目錄（設定檔、CLAUDE.md 規則、state 檔都在這）。我要做的只有一件事：review／plan-review／rescue／state 一律加 `--cwd <改動所在 repo 目錄>`（例如 `--cwd games/slot-fe-xxx`）。檔案引數（計畫檔、prompt 檔）相對我目前的 cwd 解析，放規則根的 `plans/` 即可。從上層 repo 送審 git 只看到子模組指標，CLI 會拒絕並提示；未初始化的 submodule 也會直接報錯要求 `git submodule update --init`。各 sub-repo 的 state／輪次／未審清單獨立，集中存在規則根 `.claude/state/codex-dispatch/`；在規則根跑 `state --list` 會列出全部。
    - CLI 會擋下疑似機密檔（.env、*.pem、credentials.json…），回 `local-error`：請使用者處理（移除／gitignore），不要自行加 `--allow-secrets`。
    - `critical` / `high`：**先驗證再修**——照 finding 的 body 複現失敗情境（讀碼、跑測試、或寫最小重現）；複現得了才修，複現不了就降為 medium 列給使用者並說明為什麼。（研究顯示 Codex 審 Claude 的碼會過度修正，把沒問題的改壞；驗證是防線。）修正後重送 `review`。每輪修完若專案有測試就跑。
    - 上限 `maxRounds` 輪——**CLI 會強制**：同一批改動（repo + HEAD + 目標）送審達上限就回 `local-error`（訊息含 maxRounds）。**到頂就真的停：剩下的 critical/high 只呈現、不修**，由使用者決定；使用者說修 → 修完 commit 開新一輪正常審。不要「順手修掉再記未審」——那會製造永遠審不完的尾巴。不要加 `--reset-rounds` 自行續審。`verdict=approve` 或 commit 後自動開新一輪。

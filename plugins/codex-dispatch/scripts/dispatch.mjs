@@ -32,11 +32,35 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { projectRoot, gitTopLevel, gitHeadSha, gitChangedPathsForGate, gitDiffPathsForGate, gitSubmodulePaths, codexHomeDir } from "./lib/paths.mjs";
+import { projectRoot, resolveRoots, gitTopLevel, gitHeadSha, gitChangedPathsForGate, gitDiffPathsForGate, gitSubmodulePaths, codexHomeDir } from "./lib/paths.mjs";
 import { resolveCompanion, runCompanion, parseJsonLoose, tailLines } from "./lib/companion.mjs";
 import { readQuota } from "./lib/quota.mjs";
 import { loadConfig, CONFIG_REL, DEFAULTS } from "./lib/config.mjs";
-import { loadState, addUnreviewed, clearUnreviewed, reserveRound, releaseRound, resetRounds, completeRound, purgeState, stateFile, withLock, lockStillOwned } from "./lib/state.mjs";
+import { loadState, loadAllStates, addUnreviewed, clearUnreviewed, reserveRound, releaseRound, resetRounds, completeRound, purgeAllStates, stateFile, withLock, lockStillOwned } from "./lib/state.mjs";
+
+/**
+ * 雙根解析：reviewRoot（改動所在 repo）＋ configRoot（規則所在，往上找到的已接線目錄）。
+ * 未初始化 submodule → 回 error。所有會碰 diff／state／設定的指令都從這裡拿 root。
+ */
+function rootsOrFail(kind, options, render) {
+  const roots = resolveRoots(options.cwd);
+  if (roots.error) {
+    emit(localError(kind, roots.error, { reviewRoot: roots.reviewRoot, configRoot: roots.configRoot }), options.json, render);
+    return null;
+  }
+  return roots;
+}
+
+/** 檔案引數：相對呼叫者的 cwd 解析（不是 --cwd），且必須落在 reviewRoot 或 configRoot 內的一般檔案 */
+function resolveInputFile(arg, roots) {
+  const abs = path.resolve(process.cwd(), arg);
+  if (!fs.existsSync(abs)) return { error: `找不到檔案：${abs}` };
+  if (!fs.statSync(abs).isFile()) return { error: `不是一般檔案：${abs}` };
+  const owner = [roots.reviewRoot, roots.configRoot].find((r) => insideRoot(r, abs));
+  if (!owner) return { error: `檔案必須在審查根（${roots.reviewRoot}）或規則根（${roots.configRoot}）內：${abs}` };
+  // rel 保留目錄成分：機密閘門的 .aws/ .ssh/ .gnupg/ 規則靠目錄判斷
+  return { abs, owner, rel: path.relative(owner, abs).split(path.sep).join("/") };
+}
 
 const SEVERITIES = ["critical", "high", "medium", "low"];
 const VERDICTS = ["approve", "needs-attention"];
@@ -401,7 +425,9 @@ async function cmdReview(argv) {
     valueOptions: ["base", "scope", "cwd", "retries"],
     booleanOptions: ["json", "adversarial", "native", "strict", "allow-secrets", "reset-rounds"]
   });
-  const root = projectRoot(options.cwd);
+  const roots = rootsOrFail("review", options, renderReview);
+  if (!roots) return;
+  const root = roots.reviewRoot;
   const { config: cfg } = loadConfig(root);
   const mode = options.adversarial || options.strict ? "adversarial" : options.native ? "native" : cfg.reviewMode;
   const strict = Boolean(options.strict); // 全對抗、不校準：只給「嚴格審查」用，且只跑一次
@@ -466,6 +492,8 @@ async function cmdReview(argv) {
   });
   result.mode = mode;
   result.strict = strict;
+  result.reviewRoot = roots.reviewRoot;
+  result.configRoot = roots.configRoot;
   result.round = round;
   result.maxRounds = cfg.maxRounds;
   result.cycleKey = cycleKey;
@@ -549,21 +577,21 @@ async function cmdPlanReview(argv) {
     valueOptions: ["cwd", "model", "effort", "retries"],
     booleanOptions: ["json", "allow-secrets"]
   });
-  const root = projectRoot(options.cwd);
+  const roots = rootsOrFail("plan-review", options, renderReview);
+  if (!roots) return;
+  const root = roots.reviewRoot;
   const { config: cfg } = loadConfig(root);
   const file = positionals[0];
   if (!file) return emit(localError("plan-review", "缺少計畫檔路徑：plan-review <file>"), options.json, renderReview);
-  const abs = path.resolve(root, file);
-  if (!fs.existsSync(abs)) return emit(localError("plan-review", `找不到計畫檔：${abs}`), options.json, renderReview);
-  if (!insideRoot(root, abs) || !fs.statSync(abs).isFile()) {
-    return emit(localError("plan-review", `計畫檔必須是專案根目錄（${root}）內的一般檔案：${abs}`), options.json, renderReview);
-  }
-  const gate = secretGate([path.relative(root, abs)], options["allow-secrets"]);
+  const resolved = resolveInputFile(file, roots);
+  if (resolved.error) return emit(localError("plan-review", resolved.error), options.json, renderReview);
+  const abs = resolved.abs;
+  const gate = secretGate([resolved.rel], options["allow-secrets"]);
   if (gate) return emit(localError("plan-review", gate), options.json, renderReview);
   const retries = parseRetries(options.retries);
   if (retries === null) return emit(localError("plan-review", `--retries 必須是 0..${MAX_RETRIES} 的整數`), options.json, renderReview);
   const content = fs.readFileSync(abs, "utf8");
-  const rel = path.relative(root, abs).split(path.sep).join("/");
+  const rel = resolved.rel;
   const tmp = path.join(os.tmpdir(), `codex-dispatch-plan-${crypto.randomBytes(4).toString("hex")}.md`);
   fs.writeFileSync(tmp, buildPlanPrompt(rel, content), "utf8");
   try {
@@ -582,6 +610,8 @@ async function cmdPlanReview(argv) {
       retries
     });
     result.target = { mode: "plan", label: rel };
+    result.reviewRoot = roots.reviewRoot;
+    result.configRoot = roots.configRoot;
     emit(result, options.json, renderReview);
   } finally {
     try {
@@ -598,17 +628,19 @@ async function cmdRescue(argv) {
     valueOptions: ["cwd", "model", "effort", "prompt-file", "retries"],
     booleanOptions: ["json", "write", "allow-secrets"]
   });
-  const root = projectRoot(options.cwd);
+  const roots = rootsOrFail("rescue", options, renderRescue);
+  if (!roots) return;
+  const root = roots.reviewRoot;
   const { config: cfg } = loadConfig(root);
   const prompt = positionals.join(" ").trim();
   if (!prompt && !options["prompt-file"]) return emit(localError("rescue", "缺少任務描述：rescue [--write] <prompt> 或 --prompt-file <f>"), options.json, renderRescue);
   const write = Boolean(options.write);
+  let promptFileAbs = null;
   if (options["prompt-file"]) {
-    const pf = path.resolve(root, options["prompt-file"]);
-    if (!fs.existsSync(pf) || !insideRoot(root, pf) || !fs.statSync(pf).isFile()) {
-      return emit(localError("rescue", `--prompt-file 必須是專案根目錄內的既有檔案：${pf}`), options.json, renderRescue);
-    }
-    const gate = secretGate([path.relative(root, pf)], options["allow-secrets"]);
+    const resolved = resolveInputFile(options["prompt-file"], roots);
+    if (resolved.error) return emit(localError("rescue", `--prompt-file：${resolved.error}`), options.json, renderRescue);
+    promptFileAbs = resolved.abs;
+    const gate = secretGate([resolved.rel], options["allow-secrets"]);
     if (gate) return emit(localError("rescue", gate), options.json, renderRescue);
   }
   const retries = parseRetries(options.retries, write ? 0 : 1);
@@ -618,7 +650,7 @@ async function cmdRescue(argv) {
     if (write) args.push("--write");
     if (options.model) args.push("--model", options.model);
     if (options.effort) args.push("--effort", options.effort);
-    if (options["prompt-file"]) args.push("--prompt-file", path.resolve(root, options["prompt-file"]));
+    if (promptFileAbs) args.push("--prompt-file", promptFileAbs);
     if (prompt) args.push(prompt);
     return args;
   };
@@ -632,6 +664,8 @@ async function cmdRescue(argv) {
     retries: write ? 0 : retries
   });
   result.write = write;
+  result.reviewRoot = roots.reviewRoot;
+  result.configRoot = roots.configRoot;
   emit(result, options.json, renderRescue);
 }
 
@@ -798,9 +832,11 @@ async function cmdPreflight(argv) {
 function cmdState(argv) {
   const { options } = parseArgv(argv, {
     valueOptions: ["cwd", "add-unreviewed", "reason", "kind", "scope", "error", "id"],
-    booleanOptions: ["json", "list", "clear", "self-reviewed"]
+    booleanOptions: ["json", "list", "clear", "self-reviewed", "all"]
   });
-  const root = projectRoot(options.cwd);
+  const roots = rootsOrFail("state", options, renderState);
+  if (!roots) return;
+  const root = roots.reviewRoot;
   if (options["add-unreviewed"] !== undefined) {
     if (!options["add-unreviewed"] || options["add-unreviewed"].startsWith("--")) {
       return emit(localError("state", `--add-unreviewed 後面要接描述文字（收到「${options["add-unreviewed"] || ""}」）；旗標請放在描述之後`), options.json, (x) => `✗ ${x.error}\n`);
@@ -819,8 +855,31 @@ function cmdState(argv) {
     const n = clearUnreviewed(root, options.id ? [options.id] : null);
     return emit({ ok: true, kind: "state", action: "clear", removed: n, file: stateFile(root) }, options.json, (x) => `已清除 ${x.removed} 筆未審條目\n`);
   }
+  // 在規則根執行（沒指定 --cwd 到 sub-repo）時，一併列出所有 sub-repo 的 state；壞檔只警告
+  const aggregate = options.all || (path.resolve(root) === path.resolve(roots.configRoot) && !options.cwd);
+  if (aggregate) {
+    const { states, warnings } = loadAllStates(roots.configRoot);
+    const own = stateFile(root);
+    if (!states.some((s) => s.file === own)) {
+      const st = loadState(root);
+      states.unshift({ ...st, file: own });
+    }
+    const repos = states.map((s) => ({ file: s.file, reviewRoot: s.reviewRoot || root, unreviewed: s.unreviewed, rounds: s.rounds, staleCount: s.unreviewed.filter((e) => e.stale).length }));
+    return emit({ ok: true, kind: "state", action: "list", aggregate: true, configRoot: roots.configRoot, repos, warnings }, options.json, renderStateAll);
+  }
   const st = loadState(root);
-  emit({ ok: true, kind: "state", action: "list", file: stateFile(root), unreviewed: st.unreviewed, rounds: st.rounds, staleCount: st.staleCount }, options.json, renderState);
+  emit({ ok: true, kind: "state", action: "list", file: stateFile(root), reviewRoot: root, configRoot: roots.configRoot, unreviewed: st.unreviewed, rounds: st.rounds, staleCount: st.staleCount }, options.json, renderState);
+}
+
+function renderStateAll(r) {
+  if (!r.ok) return `✗ ${r.error}\n`;
+  const lines = [`規則根 ${r.configRoot}（${r.repos.length} 個 repo）`];
+  for (const repo of r.repos) {
+    lines.push(`\n[${repo.reviewRoot}]`);
+    lines.push(renderState({ ok: true, unreviewed: repo.unreviewed, staleCount: repo.staleCount }).trimEnd());
+  }
+  for (const w of r.warnings ?? []) lines.push(`  ⚠ ${w}`);
+  return `${lines.join("\n")}\n`;
 }
 
 // ---------- snippet ----------
@@ -985,7 +1044,8 @@ function unsafePath(root, file) {
 
 function cmdUnwire(argv) {
   const { options } = parseArgv(argv, { valueOptions: ["root", "cwd"], booleanOptions: ["json", "yes", "purge-config", "purge-state"] });
-  const root = options.root ? path.resolve(options.root) : projectRoot(options.cwd);
+  // unwire 在「規則根」執行（接線段在那裡）；--root 明確指定，否則從 cwd 往上找
+  const root = options.root ? path.resolve(options.root) : resolveRoots(options.cwd).configRoot;
   const dryRun = !options.yes;
   const actions = [];
   const warnings = [];
@@ -1018,14 +1078,17 @@ function cmdUnwire(argv) {
   const purgeConfig = options["purge-config"] && fs.existsSync(cfgFile);
   if (fs.existsSync(cfgFile) && !purgeConfig) warnings.push(`保留使用者設定 ${cfgFile}（要刪加 --purge-config）`);
 
-  const statePaths = [stFile, pendingFile].filter((p) => fs.existsSync(p));
+  // state：自身 + 規則根底下所有 sub-repo 的 state（submodule 佈局）
+  const { states: allStates, warnings: stateWarnings } = loadAllStates(root);
+  const statePaths = [...new Set([...allStates.map((s) => s.file), pendingFile].filter((p) => fs.existsSync(p)))];
   const purgeStateWanted = options["purge-state"] && statePaths.length > 0;
   if (statePaths.length) {
-    const st = loadState(root);
-    if (st.unreviewed.length) {
-      warnings.push(`⚠ 未審清單仍有 ${st.unreviewed.length} 筆（${st.unreviewed.map((e) => `#${e.id} ${e.description}`).join("；")}）`);
+    const pendingTotal = allStates.reduce((n, s) => n + s.unreviewed.length, 0);
+    if (pendingTotal) {
+      warnings.push(`⚠ 未審清單仍有 ${pendingTotal} 筆（${allStates.flatMap((s) => s.unreviewed.map((e) => `#${e.id} ${e.description}`)).join("；")}）`);
     }
-    if (!purgeStateWanted) warnings.push(`保留工作流狀態 ${stFile}（要刪加 --purge-state；請先關閉其他 Claude session）`);
+    warnings.push(...stateWarnings.map((w) => `⚠ ${w}`));
+    if (!purgeStateWanted) warnings.push(`保留工作流狀態 ${stFile}${allStates.length > 1 ? ` 等 ${allStates.length} 個檔` : ""}（要刪加 --purge-state；請先關閉其他 Claude session）`);
   }
 
   // 規劃清單（執行順序：state → config → CLAUDE.md；最可能失敗的鎖操作放最前，失敗時什麼都還沒動）
@@ -1064,8 +1127,9 @@ function cmdUnwire(argv) {
       if (purgeConfig) guard(cfgFile);
 
       if (purgeStateWanted) {
-        purgeState(root); // 拿不到鎖會拋錯 → 此時尚未動任何檔案
-        for (const p of statePaths) mark(p, "done");
+        const { removed, skipped } = purgeAllStates(root); // 拿不到鎖會拋錯 → 此時尚未動任何檔案
+        for (const p of removed) mark(p, "done");
+        for (const s of skipped) warnings.push(`⚠ 未刪（無法驗證）：${s}`);
       }
       if (purgeConfig) {
         guard(cfgFile);

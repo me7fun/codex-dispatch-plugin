@@ -7,9 +7,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { gitHeadSha, gitChangedPaths } from "./paths.mjs";
+import { gitHeadSha, gitChangedPaths, findConfigRoot, canonicalPath } from "./paths.mjs";
 
 export const STATE_REL = path.join(".claude", "state", "codex-dispatch.json");
+/** 規則根 ≠ 審查根時，各 sub-repo 的 state 集中放在規則根的這個子目錄 */
+export const STATE_SUBDIR = path.join(".claude", "state", "codex-dispatch");
+const SUB_STATE_NAME = /^[A-Za-z0-9._-]+-[0-9a-f]{16}\.json$/;
 const VERSION = 1;
 const STALE_HOURS = 24;
 /** 輪次計數超過這麼久沒動就自動清除（沒有任務會跑一週還在同一批改動上） */
@@ -22,7 +25,7 @@ const ROUNDS_TTL_DAYS = 7;
 const ACTIVE_STALE_MS = 2 * 60 * 60 * 1000;
 
 function empty() {
-  return { version: VERSION, unreviewed: [], rounds: {}, roundsAt: {}, roundsActive: {}, updatedAt: null };
+  return { version: VERSION, reviewRoot: null, unreviewed: [], rounds: {}, roundsAt: {}, roundsActive: {}, updatedAt: null };
 }
 
 function touchRound(st, key) {
@@ -40,21 +43,43 @@ function activeIds(st, key) {
   return map && typeof map === "object" ? Object.keys(map) : [];
 }
 
+/**
+ * state 檔位置：
+ * - 規則根 == 審查根（單 repo）：<root>/.claude/state/codex-dispatch.json（不變）
+ * - 規則根 ≠ 審查根（submodule 佈局）：<configRoot>/.claude/state/codex-dispatch/<basename>-<sha1(canonical reviewRoot) 16 hex>.json
+ *   （game repo 裡不留任何檔；client 根已 gitignore .claude/state/）
+ */
 export function stateFile(root) {
-  return path.join(root, STATE_REL);
+  const reviewRoot = path.resolve(root);
+  const configRoot = findConfigRoot(reviewRoot);
+  if (canonicalPath(configRoot) === canonicalPath(reviewRoot)) return path.join(reviewRoot, STATE_REL);
+  const slug = (path.basename(reviewRoot) || "repo").replace(/[^A-Za-z0-9._-]+/g, "-");
+  const hash = crypto.createHash("sha1").update(canonicalPath(reviewRoot)).digest("hex").slice(0, 16);
+  return path.join(configRoot, STATE_SUBDIR, `${slug}-${hash}.json`);
+}
+
+/** 讀取並驗證一個 state 檔（不做 stale 計算）。回 {state} 或 {error}。reviewRoot 不符 → 視為碰撞，拒絕。 */
+function readStateFile(file, expectedReviewRoot) {
+  if (!fs.existsSync(file)) return { state: null };
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (err) {
+    return { error: `state 檔損壞（${file}）：${err.message}` };
+  }
+  if (!parsed || parsed.version !== VERSION) return { error: `state 檔版本不符（${file}）` };
+  if (expectedReviewRoot && parsed.reviewRoot && canonicalPath(parsed.reviewRoot) !== canonicalPath(expectedReviewRoot)) {
+    return { error: `state 檔 ${file} 屬於另一個 repo（${parsed.reviewRoot}），與 ${expectedReviewRoot} 碰撞；請手動處理` };
+  }
+  return { state: parsed };
 }
 
 export function loadState(root, { staleHours = STALE_HOURS } = {}) {
   const file = stateFile(root);
-  let st = empty();
-  if (fs.existsSync(file)) {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-      if (parsed && parsed.version === VERSION) st = { ...empty(), ...parsed };
-    } catch {
-      st = empty();
-    }
-  }
+  const read = readStateFile(file, path.resolve(root));
+  if (read.error && /碰撞/.test(read.error)) throw new Error(read.error);
+  let st = read.state ? { ...empty(), ...read.state } : empty();
+  st.reviewRoot = path.resolve(root);
   if (!Array.isArray(st.unreviewed)) st.unreviewed = [];
   if (!st.rounds || typeof st.rounds !== "object") st.rounds = {};
   if (!st.roundsAt || typeof st.roundsAt !== "object") st.roundsAt = {};
@@ -107,7 +132,12 @@ function sleepSync(ms) {
  * 所有 read-modify-write 都必須在 withLock 內做，否則兩個 session 同時寫會互蓋。
  */
 export function withLock(root, fn) {
-  const lock = `${stateFile(root)}.lock`;
+  return withLockFile(stateFile(root), fn);
+}
+
+/** 以明確的 state 檔路徑加鎖（聚合操作逐檔使用） */
+export function withLockFile(file, fn) {
+  const lock = `${file}.lock`;
   fs.mkdirSync(path.dirname(lock), { recursive: true });
   const deadline = Date.now() + LOCK_WAIT_MS;
   const token = `${process.pid}:${crypto.randomBytes(6).toString("hex")}`; // 擁有者 token：釋放時只刪自己的鎖
@@ -278,22 +308,106 @@ export function releaseRound(root, key, reservationId) {
 }
 
 /**
+ * 列出規則根底下所有 state 檔：自身的 codex-dispatch.json（若有）＋ codex-dispatch/ 子目錄中符合命名規則的一般 JSON 檔。
+ * 只列符合 <slug>-<16hex>.json 的 regular file，不碰 .lock / .tmp / symlink。
+ */
+export function listStateFiles(configRoot) {
+  const out = [];
+  const own = path.join(configRoot, STATE_REL);
+  if (fs.existsSync(own) && fs.lstatSync(own).isFile()) out.push(own);
+  const dir = path.join(configRoot, STATE_SUBDIR);
+  if (fs.existsSync(dir) && fs.lstatSync(dir).isDirectory()) {
+    for (const name of fs.readdirSync(dir)) {
+      if (!SUB_STATE_NAME.test(name)) continue;
+      const f = path.join(dir, name);
+      try {
+        if (fs.lstatSync(f).isFile()) out.push(f);
+      } catch {
+        /* 剛被 rename 走 */
+      }
+    }
+  }
+  return out;
+}
+
+/** 聚合讀取（規則根執行 state --list 用）：每個檔獨立驗證；壞檔進 warnings 不中斷。 */
+export function loadAllStates(configRoot, { staleHours = STALE_HOURS } = {}) {
+  const states = [];
+  const warnings = [];
+  for (const f of listStateFiles(configRoot)) {
+    const read = readStateFile(f, null);
+    if (read.error) {
+      warnings.push(read.error);
+      continue;
+    }
+    if (!read.state) continue;
+    const st = { ...empty(), ...read.state };
+    const cutoff = Date.now() - staleHours * 3600 * 1000;
+    st.unreviewed = (st.unreviewed || []).map((e) => ({ ...e, stale: Date.parse(e.createdAt || 0) < cutoff }));
+    st.file = f;
+    states.push(st);
+  }
+  return { states, warnings };
+}
+
+/**
  * 刪除 state 檔（unwire --purge-state 用）：在鎖內進行，其他 session 持鎖時等待/逾時，不會硬刪別人正在寫的檔。
  * 回傳實際刪掉的檔案清單。鎖檔本身由 withLock 的 finally 釋放。
  */
 export function purgeState(root) {
   const file = stateFile(root);
   const pending = path.join(path.dirname(file), "codex-pending.md");
-  return withLock(root, () => {
+  return withLockFile(file, () => {
     const removed = [];
     for (const p of [file, pending]) {
-      if (fs.existsSync(p)) {
+      if (fs.existsSync(p) && fs.lstatSync(p).isFile()) {
         fs.unlinkSync(p);
         removed.push(p);
       }
     }
     return removed;
   });
+}
+
+/**
+ * 規則根的全部 state 清除（unwire --purge-state 在規則根執行）：
+ * 自身 state + codex-pending.md + codex-dispatch/ 下每個合法 state 檔（各自鎖內、逐檔驗證後刪）。
+ * 只刪一般檔；.lock/.tmp/不符命名/損壞（無法驗證）的檔不動並回報。
+ */
+export function purgeAllStates(configRoot) {
+  const removed = [];
+  const skipped = [];
+  const own = path.join(configRoot, STATE_REL);
+  const pending = path.join(path.dirname(own), "codex-pending.md");
+  withLockFile(own, () => {
+    for (const p of [own, pending]) {
+      if (fs.existsSync(p) && fs.lstatSync(p).isFile()) {
+        fs.unlinkSync(p);
+        removed.push(p);
+      }
+    }
+  });
+  for (const f of listStateFiles(configRoot)) {
+    if (f === own) continue;
+    const read = readStateFile(f, null);
+    if (read.error) {
+      skipped.push(`${f}：${read.error}`);
+      continue;
+    }
+    withLockFile(f, () => {
+      if (fs.existsSync(f) && fs.lstatSync(f).isFile()) {
+        fs.unlinkSync(f);
+        removed.push(f);
+      }
+    });
+  }
+  const dir = path.join(configRoot, STATE_SUBDIR);
+  try {
+    if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+  } catch {
+    /* 留著無妨 */
+  }
+  return { removed, skipped };
 }
 
 export function resetRounds(root, key = null) {
