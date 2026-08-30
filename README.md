@@ -101,6 +101,21 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 
 **為什麼要校準**：官方 adversarial prompt 的定義是「只要有任何實質風險就 needs-attention，找不到任何可成立的對抗性發現才 approve」——它是拿來打擊信心的最終稽核，不是拿來收斂的。直接用它跑迴圈，每批改動都會跑滿 3 輪、而且越修越偏向「兩個視窗同一毫秒」這類極端情境（本 repo 早期就是這樣，留下一堆「修了但沒再審」的尾巴）。社群做法與研究一致：迴圈用一般審查、2–3 輪收斂、confidence ≥ 0.75 才算、對抗式只在最後跑一次；另有研究指出 Codex 審 Claude 的碼會過度修正，所以修 HIGH 前先驗證能複現。詳見 `plans/` 審查紀錄。
 
+## 機械檢查先行（Ground Truth）
+
+送 Codex 前先跑你自己的 test／lint／typecheck，任一失敗就**不送 Codex、不佔輪次**（確定的失敗不需要 AI 判斷，也省額度）；全過的結果附進 prompt 當 Codex 的根據。設定放**本機、不進 git** 的檔案（因為它會執行 shell 指令，不能讓 clone 下來的設定替你跑）：
+
+`<規則根>/.claude/codex-dispatch.local.json`
+```json
+{ "checks": ["npm test --silent", "npm run lint"], "checksTimeoutSec": 300 }
+```
+- 此檔被 git 追蹤時整組停用並警告；最多 10 條、逾時 10–1800 秒；失敗回 `reason=checks-failed`（exit 2）。
+- 只在 adversarial 模式會把結果附進 prompt；native 模式只當閘門。`--skip-checks` 跳過（Claude 只在你明說時用）。
+
+## 收工兜底（Stop hook）
+
+本 session 用過 dispatch 且未審清單非空時，最終回覆必須有「⚠ 未經 Codex 審查」標題，否則 Stop hook 擋下要求補上（同一輪最多擋 2 次）。**它只看文字與本機 state，零 Codex 呼叫**——跟官方 review gate 撞限額無限迴圈的問題無關。同一批未審標過一次後不再重複擋。
+
 ## 底層 CLI
 
 所有 Codex 呼叫走 `plugins/codex-dispatch/scripts/dispatch.mjs`（`--json` 回統一結果物件；exit 0 成功、1 Codex 端失敗、2 本地錯誤）：

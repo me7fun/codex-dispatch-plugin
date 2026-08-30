@@ -7,10 +7,11 @@
  *   quota                         Codex 額度快照（available / exhausted / unknown）
  *   preflight [--write-windows-sandbox]
  *                                 綜合檢查：官方 plugin、codex 登入、git repo、Windows 沙箱設定、額度
- *   review [--adversarial|--native|--strict] [--base <ref>] [--scope auto|working-tree|branch] [--retries N] [--allow-secrets] [--reset-rounds] [focus...]
+ *   review [--adversarial|--native|--strict] [--base <ref>] [--scope auto|working-tree|branch] [--retries N] [--allow-secrets] [--reset-rounds] [--skip-checks] [focus...]
  *                                 送審 diff（預設模式依設定 reviewMode）。adversarial 模式自動附嚴重度校準（HIGH 限單人正常操作、
  *                                 confidence 門檻、沒有 HIGH 即 approve）；--strict 為全對抗不校準，只給「嚴格審查」用且只跑一次。
- *                                 機密檔閘門；同一批改動（repo+HEAD+目標）最多 maxRounds 輪
+ *                                 機密檔閘門；同一批改動（repo+HEAD+目標）最多 maxRounds 輪。
+ *                                 機械檢查（ground truth）：<規則根>/.claude/codex-dispatch.local.json 的 checks 先跑，失敗 → reason=checks-failed（exit 2）不送 Codex
  *   plan-review <file> [--model m] [--effort e] [--allow-secrets]
  *                                 請 Codex 唯讀審計畫檔，要求回 JSON
  *   rescue [--write] [--model m] [--effort e] [--prompt-file f] [--allow-secrets] [prompt...]
@@ -35,7 +36,7 @@ import { spawnSync } from "node:child_process";
 import { projectRoot, resolveRoots, gitTopLevel, gitHeadSha, gitChangedPathsForGate, gitDiffPathsForGate, gitSubmodulePaths, codexHomeDir } from "./lib/paths.mjs";
 import { resolveCompanion, runCompanion, parseJsonLoose, tailLines } from "./lib/companion.mjs";
 import { readQuota } from "./lib/quota.mjs";
-import { loadConfig, CONFIG_REL, DEFAULTS } from "./lib/config.mjs";
+import { loadConfig, CONFIG_REL, LOCAL_CONFIG_REL, DEFAULTS } from "./lib/config.mjs";
 import { loadState, loadAllStates, addUnreviewed, clearUnreviewed, reserveRound, releaseRound, resetRounds, completeRound, purgeAllStates, stateFile, withLock, lockStillOwned } from "./lib/state.mjs";
 
 /**
@@ -125,7 +126,7 @@ function localError(kind, error, extra = {}) {
 
 function exitCodeFor(r) {
   if (r.ok) return 0;
-  return r.reason === "local-error" ? 2 : 1;
+  return r.reason === "local-error" || r.reason === "checks-failed" ? 2 : 1;
 }
 
 function emit(result, json, render) {
@@ -333,6 +334,54 @@ function interpretSpawn(r) {
   return null;
 }
 
+// ---------- ground truth checks ----------
+/**
+ * 機械檢查（test / lint / typecheck）：在審查根執行本機設定的 checks。
+ * 任一失敗 → 不送 Codex（確定的失敗不需要 AI 判斷，也省額度）。全過 → 摘要附進 prompt 當根據。
+ * 輸出有界：maxBuffer 8MB，回傳最後 30 行、每行 400 字；逾時／訊號／spawn 錯誤分開標示。
+ */
+function runChecks(reviewRoot, cfg) {
+  const results = [];
+  for (const cmd of cfg.checks) {
+    const started = Date.now();
+    const r = spawnSync(cmd, { cwd: reviewRoot, shell: true, encoding: "utf8", windowsHide: true, timeout: cfg.checksTimeoutSec * 1000, maxBuffer: 8 * 1024 * 1024 });
+    const durationMs = Date.now() - started;
+    const timedOut = Boolean(r.error && r.error.code === "ETIMEDOUT");
+    const overflow = Boolean(r.error && r.error.code === "ENOBUFS");
+    const out = `${r.stdout || ""}\n${r.stderr || ""}`;
+    const tail = out
+      .split(/\r?\n/)
+      .filter((l) => l.trim())
+      .slice(-30)
+      .map((l) => (l.length > 400 ? `${l.slice(0, 400)}…` : l))
+      .join("\n");
+    const ok = r.status === 0 && !r.error && !r.signal;
+    results.push({
+      cmd,
+      ok,
+      status: r.status,
+      signal: r.signal ?? null,
+      timedOut,
+      error: r.error ? (timedOut ? `逾時（${cfg.checksTimeoutSec}s）` : overflow ? "輸出超過 8MB" : r.error.message) : null,
+      durationMs,
+      tail
+    });
+    if (!ok) break; // 第一個失敗就停，後面不跑
+  }
+  return results;
+}
+
+function checksSummaryForPrompt(results) {
+  if (!results.length) return "";
+  return `Ground truth (mechanical checks already run by the harness; treat as facts):\n${results.map((c) => `- ${c.cmd} → exit ${c.status} (${Math.round(c.durationMs / 1000)}s)`).join("\n")}\n`;
+}
+
+function renderChecks(results) {
+  return results
+    .map((c) => `  ${c.ok ? "✓" : "✗"} ${c.cmd}  (${Math.round(c.durationMs / 1000)}s${c.error ? `, ${c.error}` : c.signal ? `, signal ${c.signal}` : `, exit ${c.status}`})${c.ok ? "" : `\n${c.tail.split("\n").map((l) => `      ${l}`).join("\n")}`}`)
+    .join("\n");
+}
+
 // ---------- review ----------
 /**
  * 自動迴圈用的嚴重度校準（附在 adversarial focus 前面）。
@@ -423,17 +472,23 @@ function interpretReview(mode) {
 async function cmdReview(argv) {
   const { options, positionals } = parseArgv(argv, {
     valueOptions: ["base", "scope", "cwd", "retries"],
-    booleanOptions: ["json", "adversarial", "native", "strict", "allow-secrets", "reset-rounds"]
+    booleanOptions: ["json", "adversarial", "native", "strict", "allow-secrets", "reset-rounds", "skip-checks"]
   });
   const roots = rootsOrFail("review", options, renderReview);
   if (!roots) return;
   const root = roots.reviewRoot;
-  const { config: cfg } = loadConfig(root);
+  const { config: cfg, checksWarnings } = loadConfig(root);
   const mode = options.adversarial || options.strict ? "adversarial" : options.native ? "native" : cfg.reviewMode;
   const strict = Boolean(options.strict); // 全對抗、不校準：只給「嚴格審查」用，且只跑一次
   let result_note_subs = null; // 這次 diff 裡混有 submodule 指標變更（其內容不會被審）
   const userFocus = positionals.join(" ").trim();
-  const focus = mode === "adversarial" && !strict ? `${calibrationText(cfg.confidenceThreshold)}\n${userFocus || "Implementation defects and correctness of the change."}` : userFocus;
+  let checksResults = []; // 稍後（所有閘門通過、佔輪次之前）執行
+  const buildFocus = () =>
+    mode === "adversarial" && !strict
+      ? `${calibrationText(cfg.confidenceThreshold)}\n${checksSummaryForPrompt(checksResults)}${userFocus || "Implementation defects and correctness of the change."}`
+      : mode === "adversarial"
+        ? `${checksSummaryForPrompt(checksResults)}${userFocus}`.trim()
+        : userFocus; // native 模式吃不到 focus：checks 只當閘門，結果只在輸出裡
   if (!gitTopLevel(root)) return emit(localError("review", `${root} 不是 git repo；Codex review 依賴 git diff，請先 git init`), options.json, renderReview);
   const retries = parseRetries(options.retries);
   if (retries === null) return emit(localError("review", `--retries 必須是 0..${MAX_RETRIES} 的整數`), options.json, renderReview);
@@ -461,6 +516,32 @@ async function cmdReview(argv) {
   }
   const gate = secretGate(target.paths, options["allow-secrets"]);
   if (gate) return emit(localError("review", gate), options.json, renderReview);
+
+  // 順序：引數／根／diff／機密閘門 → 額度預檢（便宜） → 機械檢查（可能很貴） → 佔輪次 → Codex
+  const quotaEarly = await quotaFor(cfg);
+  if (quotaEarly.status === "exhausted") {
+    const r = base("review");
+    r.reason = "quota";
+    r.quota = quotaEarly;
+    r.error = quotaMessage(quotaEarly);
+    r.mode = mode;
+    r.reviewRoot = roots.reviewRoot;
+    r.configRoot = roots.configRoot;
+    return emit(r, options.json, renderReview);
+  }
+  if (cfg.checks.length && !options["skip-checks"]) {
+    checksResults = runChecks(root, cfg);
+    const failed = checksResults.find((c) => !c.ok);
+    if (failed) {
+      // 確定的失敗：不送 Codex、不佔輪次。exit 2（本地分類，不是 Codex 問題）
+      return emit(
+        { ...localError("review", `機械檢查失敗：${failed.cmd}${failed.error ? `（${failed.error}）` : `（exit ${failed.status}）`}；先修到通過再送審`), reason: "checks-failed", checks: checksResults, checksWarnings, mode, reviewRoot: roots.reviewRoot, configRoot: roots.configRoot },
+        options.json,
+        renderReview
+      );
+    }
+  }
+  const focus = buildFocus();
 
   // maxRounds 由 CLI 強制：同一 cycle（repo+HEAD+目標）送審次數達上限就拒絕，交使用者裁決
   const cycleKey = reviewCycleKey(root, { mode, base: options.base, scope: options.scope });
@@ -494,6 +575,9 @@ async function cmdReview(argv) {
   result.strict = strict;
   result.reviewRoot = roots.reviewRoot;
   result.configRoot = roots.configRoot;
+  result.checks = checksResults;
+  if (checksWarnings.length) result.checksWarnings = checksWarnings;
+  if (options["skip-checks"] && cfg.checks.length) result.checksSkipped = true;
   result.round = round;
   result.maxRounds = cfg.maxRounds;
   result.cycleKey = cycleKey;
@@ -822,6 +906,16 @@ async function cmdPreflight(argv) {
   });
 
   checks.push({ name: "config", required: false, status: warning ? "warn" : "ok", detail: warning ?? `${source === "defaults" ? "使用預設值" : source}` });
+  const { checksSource, checksWarnings } = loadConfig(root);
+  checks.push({
+    name: "groundTruth",
+    required: false,
+    status: checksWarnings.length ? "warn" : "ok",
+    detail: cfg.checks.length
+      ? `${cfg.checks.length} 條機械檢查（${checksSource}，逾時 ${cfg.checksTimeoutSec}s）：${cfg.checks.join(" ; ")}`
+      : `未設定機械檢查（可在 <規則根>/${LOCAL_CONFIG_REL} 設 "checks": ["npm test"]，此檔不進 git）`,
+    fix: checksWarnings.length ? checksWarnings.join("；") : undefined
+  });
 
   const ready = checks.every((c) => !c.required || c.status === "ok");
   const result = { ok: ready, kind: "preflight", reason: ready ? null : "local-error", root, config: cfg, checks, quota: q };
@@ -1193,13 +1287,17 @@ function renderFindings(findings) {
 
 function renderFailure(r) {
   const lines = [`✗ ${r.kind} 失敗（reason=${r.reason}，attempts=${r.attempts}）`, `  ${r.error ?? "(無錯誤訊息)"}`];
+  if (r.checks?.length) lines.push("  機械檢查：", renderChecks(r.checks));
   if (r.quota) lines.push(`  ${quotaMessage(r.quota)}`);
+  for (const w of r.checksWarnings ?? []) lines.push(`  ⚠ ${w}`);
   return `${lines.join("\n")}\n`;
 }
 
 function renderReview(r) {
   if (!r.ok) return renderFailure(r);
-  const head = `# Codex ${r.kind}${r.mode ? ` (${r.mode})` : ""}\nTarget: ${r.target?.label ?? "?"}${r.round ? `\nRound: ${r.round}/${r.maxRounds}` : ""}${r.quota ? `\n${quotaMessage(r.quota)}` : ""}${r.submodulesSkipped ? `\n⚠ 未審到 submodule 內的改動：${r.submodulesSkipped.join(", ")}（請 --cwd 進該 repo 另外送審）` : ""}\n`;
+  const checksLine = r.checks?.length ? `\nGround truth:\n${renderChecks(r.checks)}` : r.checksSkipped ? "\n⚠ 機械檢查已跳過（--skip-checks）" : "";
+  const warnLines = (r.checksWarnings ?? []).map((w) => `\n⚠ ${w}`).join("");
+  const head = `# Codex ${r.kind}${r.mode ? ` (${r.mode})` : ""}\nTarget: ${r.target?.label ?? "?"}${r.round ? `\nRound: ${r.round}/${r.maxRounds}` : ""}${r.quota ? `\n${quotaMessage(r.quota)}` : ""}${checksLine}${warnLines}${r.submodulesSkipped ? `\n⚠ 未審到 submodule 內的改動：${r.submodulesSkipped.join(", ")}（請 --cwd 進該 repo 另外送審）` : ""}\n`;
   if (r.verdict === null || r.verdict === undefined) return `${head}\n${r.raw ?? ""}\n${r.note ? `\n（${r.note}）\n` : ""}`;
   const low = r.lowConfidence?.length ? `\n## Low confidence (< ${r.confidenceThreshold}，只供參考、不自動修)\n${renderFindings(r.lowConfidence)}` : "";
   return `${head}${r.strict ? "Mode: strict adversarial（未校準，只跑一次）\n" : ""}\nVerdict: ${r.verdict}\n${r.summary ? `${r.summary}\n` : ""}\n## Findings\n${renderFindings(r.findings)}${low}${r.nextSteps?.length ? `\n## Next steps\n${r.nextSteps.map((s) => `- ${s}`).join("\n")}\n` : ""}`;

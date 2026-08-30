@@ -28,7 +28,8 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/dispatch.mjs" <子指令> --json ...
    - 送審範圍是整個 working tree：若 `git status` 顯示有**不是我這次改的**未提交變更，先告知使用者「這些會一起被審」；要只審某段就用 `--base <ref>`／`--scope branch`。
    - **submodule／多 repo 佈局**（例如 client 根下 `games/<game>/` 各是自己的 repo，而規則、plans/、設定都在 client 根）：CLI 用**雙根**——**審查根**＝改動所在的 repo（diff、HEAD、輪次以它為準），**規則根**＝從審查根往上找到的已接線目錄（設定檔、CLAUDE.md 規則、state 檔都在這）。我要做的只有一件事：review／plan-review／rescue／state 一律加 `--cwd <改動所在 repo 目錄>`（例如 `--cwd games/slot-fe-xxx`）。檔案引數（計畫檔、prompt 檔）相對我目前的 cwd 解析，放規則根的 `plans/` 即可。從上層 repo 送審 git 只看到子模組指標，CLI 會拒絕並提示；未初始化的 submodule 也會直接報錯要求 `git submodule update --init`。各 sub-repo 的 state／輪次／未審清單獨立，集中存在規則根 `.claude/state/codex-dispatch/`；在規則根跑 `state --list` 會列出全部。
    - CLI 會擋下疑似機密檔（.env、*.pem、credentials.json…），回 `local-error`：請使用者處理（移除／gitignore），不要自行加 `--allow-secrets`。
-   - `critical` / `high`：**先驗證再修**——照 finding 的 body 複現失敗情境（讀碼、跑測試、或寫最小重現）；複現得了才修，複現不了就降為 medium 列給使用者並說明為什麼。（研究顯示 Codex 審 Claude 的碼會過度修正，把沒問題的改壞；驗證是防線。）修正後重送 `review`。每輪修完若專案有測試就跑。
+   - **機械檢查先行（ground truth）**：若規則根有 `.claude/codex-dispatch.local.json` 的 `checks`（test／lint／typecheck；此檔不進 git，只有使用者自己能設），CLI 會先跑，任一失敗回 `reason=checks-failed`（exit 2）且**不送 Codex、不佔輪次**——這是確定的失敗，先修到通過再送；不要加 `--skip-checks`，除非使用者明說。全過的結果會附進 prompt 當 Codex 的根據。專案沒設 checks 但有測試指令時，建議使用者設一次。
+   - `critical` / `high`：**先驗證再修**——照 finding 的 body 複現失敗情境（讀碼、跑測試、或寫最小重現）；複現得了才修，複現不了就降為 medium 列給使用者並說明為什麼。（研究顯示 Codex 審 Claude 的碼會過度修正，把沒問題的改壞；驗證是防線。）**只改 finding 指到的位置與必要的關聯處**，不重寫、不順手重構其他地方——下一輪抓到的「修正引入的新 bug」多半來自順手改。修正後重送 `review`。
    - 上限 `maxRounds` 輪——**CLI 會強制**：同一批改動（repo + HEAD + 目標）送審達上限就回 `local-error`（訊息含 maxRounds）。**到頂就真的停：剩下的 critical/high 只呈現、不修**，由使用者決定；使用者說修 → 修完 commit 開新一輪正常審。不要「順手修掉再記未審」——那會製造永遠審不完的尾巴。不要加 `--reset-rounds` 自行續審。`verdict=approve` 或 commit 後自動開新一輪。
    - **同一 finding（file + title 相同）連續兩輪都出現 → 視為無進展，停止並交使用者裁決。**
    - `medium` / `low` / `lowConfidence`：列出交使用者決定，不自行修改。
@@ -66,6 +67,19 @@ CLI 已內建：送審前查額度（`exhausted` 直接不送）、非額度失�
 1. `state --list --json`。未審清單為空 → 正常收工。
 2. 非空 → `quota --json`。`available` → 對目前 working tree 跑一次 `review --json` 補審（仍受 maxRounds）。成功後只清除**這次審查確實涵蓋的條目**：條目的 `changedPaths` 仍在目前 working tree 且 `headSha` 相同 → `state --clear --id <id>`；已被 commit 走的條目不算涵蓋，保留並告知使用者。
 3. 仍失敗或額度未恢復 → 最終回覆最上方加醒目標題 **「⚠ 未經 Codex 審查」**（該條目若已自審，標題後加「（已由 Claude 自審）」），逐項列出：改了什麼、原因（額度用完／連線失敗）、重置時間、是否自審；建議使用者稍後 `/codex-dispatch:review`。清單**不會自動清除**（超過 24h 標示 STALE），只有補審成功或使用者明確說不審才 `state --clear`。
+
+## 交還格式（要人裁決時一律用這個，不要自由發揮）
+到頂剩 HIGH、Codex 失敗走 B、rescue 失敗、同一 finding 連兩輪、或任何需要使用者決定的情況，最終回覆用：
+```
+## 交還：<一句話說明任務>
+**目前成果**：<改了哪些檔／是否已 commit／測試狀態>
+**試過的修正**：round 1 → <一句>；round 2 → <一句>；…
+**剩餘**：critical N／high N／medium N／low N／低信心 N
+- [<severity>] <檔案:行> <一句話問題> → <建議修法>
+**根據**：<機械檢查結果／Codex verdict 與輪次／未審清單編號>
+**要你決定**：<具體選項 A／B／C>
+```
+未審清單非空時，回覆最上方另加「⚠ 未經 Codex 審查」標題（Stop hook 會檢查這個標題；沒有會被擋下重答）。
 
 ## 使用者體驗
 規則寫給我看，使用者照常下指令（「幫我加 XX」）即可，不需背任何 Codex 指令。我只在需要決策（B 情境、medium/low findings、輪次到頂）時打擾使用者。

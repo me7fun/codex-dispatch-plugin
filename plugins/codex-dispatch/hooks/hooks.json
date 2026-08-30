@@ -1,5 +1,5 @@
 {
-  "description": "codex-dispatch：SessionStart 注入調度規則摘要（fail-soft，不查額度）",
+  "description": "codex-dispatch：SessionStart 注入規則摘要；PostToolUse 記錄本 session 是否用過 dispatch；Stop 兜底——未審清單非空而回覆沒有「⚠ 未經 Codex 審查」標題就擋下（不呼叫 Codex，零額度、不會無限迴圈）",
   "hooks": {
     "SessionStart": [
       {
@@ -7,6 +7,29 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/stop-gate.mjs\" mark",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/stop-gate.mjs\" gate",
             "timeout": 5
           }
         ]
