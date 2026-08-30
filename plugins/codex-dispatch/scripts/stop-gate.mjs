@@ -24,7 +24,11 @@ import path from "node:path";
 import crypto from "node:crypto";
 
 const MAX_BLOCKS_PER_TURN = 2;
-const HEADING_RE = new RegExp("^[ \\t]*(?:>[ \\t]*)*(?:#{1,6}[ \\t]+)?(?:\\*\\*)?[ \\t]*(?:⚠[ \\t]*)?未經[ \\t]*Codex[ \\t]*審查", "i");
+// 整行必須就是標題：可帶引用符／#／粗體／⚠，後綴只允許「（N 筆）」「（已由 Claude 自審）」這類括號註記，行尾錨定——散文開頭湊巧相同不算
+const HEADING_RE = new RegExp(
+  "^[ \\t]*(?:>[ \\t]*)*(?:#{1,6}[ \\t]+)?(?:\\*\\*)?[ \\t]*(?:⚠️?[ \\t]*)?未經[ \\t]*Codex[ \\t]*審查(?:[ \\t]*[（(][^()（）]{0,40}[)）])?(?:\\*\\*)?[ \\t]*[:：]?[ \\t]*$",
+  "i"
+);
 const FENCE_RE = /^[ \t]*(?:>[ \t]*)*(`{3,}|~{3,})/;
 // 只認「node <路徑>dispatch.mjs <子指令>」這種真正的呼叫；echo／註解／引用文字不算。單一 shell 片段內（不跨 | & ;）。
 const INVOKE_RE = /(?:^|[|&;]\s*)node\b[^|&;]*?[\\/]dispatch\.mjs["']?\s+(?:review|plan-review|rescue|state\s+--add-unreviewed)\b/;
