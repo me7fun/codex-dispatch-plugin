@@ -1,7 +1,7 @@
 {
   "name": "codex-dispatch",
   "displayName": "Codex Dispatch",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Claude 寫、Codex 審：調度規則、額度預檢、失敗策略、未審清單。需先安裝官方 codex@openai-codex。",
   "author": {
     "name": "Mickey"
