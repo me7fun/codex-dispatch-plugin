@@ -8,6 +8,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { loadConfig } from "./lib/config.mjs";
 
 function out(obj) {
   process.stdout.write(`${JSON.stringify(obj)}\n`);
@@ -73,16 +74,32 @@ try {
     hasGitlinks = false;
   }
 
+  // 開關：reviewer=claude（不用 Codex，全走自審、不提醒）、planner=off（不用 Antigravity）。設定壞掉 → loadConfig 自己回預設
+  let cfg = null;
+  try {
+    cfg = loadConfig(root).config;
+  } catch {
+    cfg = null;
+  }
+  const claudeOnly = cfg?.reviewer === "claude";
+  const plannerOff = cfg?.planner === "off";
+  const planStep = plannerOff ? "先寫計畫" : "先 `plan-architect`（Antigravity CLI `agy` 唯讀出草案；未裝或失敗就自己寫）→ 審閱修訂";
+  const planReview = claudeOnly ? "自審計畫（Claude 唯讀 subagent）" : "送 Codex 審計畫";
+
   const lines = wired
     ? [
-        "[codex-dispatch] 本專案啟用「Claude 寫、Codex 審」：",
-        "- 估計改動 >50 行或 >3 檔（或使用者說「先寫計畫」）→ 先 `plan-architect`（Antigravity CLI `agy` 唯讀出草案；未裝或失敗就自己寫）→ 審閱修訂 → 送 Codex 審計畫 → 再實作。",
-        "- 實作完成 → 送 Codex 審 diff；critical/high 修正後重審（上限 3 輪），medium/low 交使用者決定。",
-        "- 同一 bug 修 2 次失敗 → 交 Codex 救援（唯讀診斷）。小改動不送審。",
-        "- Codex 失敗絕不阻塞：審 diff 失敗記入未審清單、繼續；審計畫/救援失敗詢問使用者。收工前補審或逐項標記。",
+        claudeOnly ? "[codex-dispatch] 本專案啟用 Claude 自審（reviewer=claude，Codex 已停用）：" : "[codex-dispatch] 本專案啟用「Claude 寫、Codex 審」：",
+        `- 估計改動 >50 行或 >3 檔（或使用者說「先寫計畫」）→ ${planStep} → ${planReview} → 再實作。`,
+        claudeOnly
+          ? "- 實作完成 → 自審 diff（Claude 唯讀 subagent，上限 2 輪）；critical/high 修正後重審，medium/low 交使用者決定。"
+          : "- 實作完成 → 送 Codex 審 diff；critical/high 修正後重審（上限 3 輪），medium/low 交使用者決定。",
+        claudeOnly ? "- 同一 bug 修 2 次失敗 → 自審救援（subagent 重新診斷）。小改動不審。" : "- 同一 bug 修 2 次失敗 → 交 Codex 救援（唯讀診斷）。小改動不送審。",
+        claudeOnly
+          ? "- 自審是使用者的設定，不是降級：不佔 Codex 額度、不進未審清單、不加任何「未經 Codex 審查」標記、收工前步驟跳過。"
+          : "- Codex 失敗絕不阻塞：審 diff 失敗記入未審清單、繼續；審計畫/救援失敗詢問使用者。收工前補審或逐項標記。",
         "- 完整規則與指令：先載入 Skill `codex-dispatch:dispatch` 再動工。",
         hasGitlinks ? "- 本 repo 含 submodule：改動在 sub-repo（例如 games/<game>/）時，review／plan-review／state 一律加 `--cwd <該目錄>`；各 sub-repo 的 state、輪次獨立，集中存在本根的 .claude/state/codex-dispatch/。" : null,
-        pending ? `- ⚠ 未審清單有 ${pending} 筆待補審（收工前處理）。` : null,
+        pending ? (claudeOnly ? `- ⚠ 未審清單殘留 ${pending} 筆（reviewer=claude 不再補審，也不會被擋）；確認不需要後 \`state --clear\`。` : `- ⚠ 未審清單有 ${pending} 筆待補審（收工前處理）。`) : null,
         broken.length ? `- ⚠ ${broken.join("、")} 的 codex-dispatch 標記段損壞（start/end 不成對或順序反），setup/uninstall 會拒絕動它；請手動修正。` : null
       ].filter(Boolean)
     : [

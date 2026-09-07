@@ -31,7 +31,12 @@
  *                                 config / state 是使用者設定與工作流狀態，預設保留，要加旗標才刪；永不碰 plans/。
  *                                 plugin 本體另外用 claude plugin uninstall。
  *
- * exit code：0 成功；1 Codex／agy 端失敗（quota / codex-error / agy-not-installed / agy-error / invalid-output）；2 本地錯誤（local-error / checks-failed）
+ * 開關（設定檔）：reviewer=claude → review / plan-review / rescue 不碰 Codex（不查額度、不佔輪次、不外送；review 仍跑 checks），
+ *                 回 reason=reviewer-claude 並附 target／reviewRoot 交 Skill 走 Claude 自審 subagent；planner=off → plan-architect 回 planner-off。
+ *                 這兩個是使用者的決定，不記未審清單、Stop hook 放行。
+ *
+ * exit code：0 成功；1 Codex／agy 端失敗或開關短路（quota / codex-error / agy-not-installed / agy-error / invalid-output / reviewer-claude / planner-off）；
+ *            2 本地錯誤（local-error / checks-failed）
  */
 import fs from "node:fs";
 import os from "node:os";
@@ -197,8 +202,8 @@ function reviewPaths(root, { base, scope }) {
   const set = new Set(gitChangedPathsForGate(root));
   const wantBranch = Boolean(base) || scope === "branch";
   let resolved = true;
+  let ref = base || null;
   if (wantBranch) {
-    let ref = base;
     if (!ref) {
       for (const cand of ["main", "master", "origin/main", "origin/master"]) {
         const r = spawnSync("git", ["rev-parse", "--verify", "--quiet", cand], { cwd: root, encoding: "utf8", windowsHide: true });
@@ -212,7 +217,7 @@ function reviewPaths(root, { base, scope }) {
     if (diffPaths) diffPaths.forEach((p) => set.add(p));
     else resolved = false; // 沒有候選 base、ref 無效、或沒有 merge base → 無法列舉，fail-closed
   }
-  return { paths: [...set], resolved, ref: wantBranch ? (base || null) : null };
+  return { paths: [...set], resolved, ref: wantBranch ? ref ?? null : null, mode: wantBranch ? "branch" : "working-tree" };
 }
 
 /** 統一的機密閘門：所有會把內容送到外部模型（Codex／Antigravity）的指令都必須先過。回 null 表示可送。 */
@@ -519,6 +524,33 @@ async function cmdReview(argv) {
       : "--scope branch 找不到基準分支（只認 main/master/origin/main/origin/master）";
     return emit(localError("review", `${why}；機密閘門無法列舉 diff，拒絕送審。請確認 ref 或明確指定 --base <ref>`), options.json, renderReview);
   }
+  // 機械檢查（ground truth）：任一失敗 → 不送 Codex、不佔輪次。exit 2（本地分類，不是 Codex 問題）
+  const runGroundTruth = () => {
+    if (!cfg.checks.length || options["skip-checks"]) return null;
+    checksResults = runChecks(root, cfg);
+    const failed = checksResults.find((c) => !c.ok);
+    if (!failed) return null;
+    return { ...localError("review", `機械檢查失敗：${failed.cmd}${failed.error ? `（${failed.error}）` : `（exit ${failed.status}）`}；先修到通過再送審`), reason: "checks-failed", checks: checksResults, checksWarnings, mode, reviewRoot: roots.reviewRoot, configRoot: roots.configRoot };
+  };
+  if (cfg.reviewer === "claude") {
+    // 使用者選擇不用 Codex：不外送（免機密閘門）、不查額度、不佔輪次；只跑 ground truth，把目標交回 Skill 開自審 subagent
+    const gt = runGroundTruth();
+    if (gt) return emit(gt, options.json, renderReview);
+    return emit(
+      {
+        ...base("review", { reason: "reviewer-claude", error: "reviewer=claude：Codex 已停用，請依 Skill 用 Claude 唯讀 subagent 自審（self-review.md A 變體）" }),
+        reviewer: "claude",
+        target: { mode: target.mode, label: target.mode === "branch" ? `branch diff vs ${target.ref}` : "working tree diff", base: target.ref, scope: options.scope ?? "auto" },
+        checks: checksResults,
+        checksWarnings,
+        mode,
+        reviewRoot: roots.reviewRoot,
+        configRoot: roots.configRoot
+      },
+      options.json,
+      renderReview
+    );
+  }
   const gate = secretGate(target.paths, options["allow-secrets"]);
   if (gate) return emit(localError("review", gate), options.json, renderReview);
 
@@ -534,18 +566,8 @@ async function cmdReview(argv) {
     r.configRoot = roots.configRoot;
     return emit(r, options.json, renderReview);
   }
-  if (cfg.checks.length && !options["skip-checks"]) {
-    checksResults = runChecks(root, cfg);
-    const failed = checksResults.find((c) => !c.ok);
-    if (failed) {
-      // 確定的失敗：不送 Codex、不佔輪次。exit 2（本地分類，不是 Codex 問題）
-      return emit(
-        { ...localError("review", `機械檢查失敗：${failed.cmd}${failed.error ? `（${failed.error}）` : `（exit ${failed.status}）`}；先修到通過再送審`), reason: "checks-failed", checks: checksResults, checksWarnings, mode, reviewRoot: roots.reviewRoot, configRoot: roots.configRoot },
-        options.json,
-        renderReview
-      );
-    }
-  }
+  const gt = runGroundTruth();
+  if (gt) return emit(gt, options.json, renderReview);
   const focus = buildFocus();
 
   // maxRounds 由 CLI 強制：同一 cycle（repo+HEAD+目標）送審次數達上限就拒絕，交使用者裁決
@@ -675,6 +697,13 @@ async function cmdPlanReview(argv) {
   const resolved = resolveInputFile(file, roots);
   if (resolved.error) return emit(localError("plan-review", resolved.error), options.json, renderReview);
   const abs = resolved.abs;
+  if (cfg.reviewer === "claude") {
+    return emit(
+      { ...base("plan-review", { reason: "reviewer-claude", error: "reviewer=claude：Codex 已停用，請依 Skill 用 Claude 唯讀 subagent 審計畫（self-review.md B 變體）" }), reviewer: "claude", target: { mode: "plan", label: resolved.rel, path: abs }, reviewRoot: roots.reviewRoot, configRoot: roots.configRoot },
+      options.json,
+      renderReview
+    );
+  }
   const gate = secretGate([resolved.rel], options["allow-secrets"]);
   if (gate) return emit(localError("plan-review", gate), options.json, renderReview);
   const retries = parseRetries(options.retries);
@@ -724,6 +753,13 @@ async function cmdRescue(argv) {
   const prompt = positionals.join(" ").trim();
   if (!prompt && !options["prompt-file"]) return emit(localError("rescue", "缺少任務描述：rescue [--write] <prompt> 或 --prompt-file <f>"), options.json, renderRescue);
   const write = Boolean(options.write);
+  if (cfg.reviewer === "claude") {
+    return emit(
+      { ...base("rescue", { reason: "reviewer-claude", error: "reviewer=claude：Codex 已停用，請依 Skill 用 Claude 唯讀 subagent 重新診斷（self-review.md C 變體）" }), reviewer: "claude", write, reviewRoot: roots.reviewRoot, configRoot: roots.configRoot },
+      options.json,
+      renderRescue
+    );
+  }
   let promptFileAbs = null;
   if (options["prompt-file"]) {
     const resolved = resolveInputFile(options["prompt-file"], roots);
@@ -1013,6 +1049,13 @@ async function cmdPlanArchitect(argv) {
   if (options.effort !== undefined && !AGY_EFFORTS.includes(options.effort)) return fail(`--effort 只接受 ${AGY_EFFORTS.join("|")}`);
   const timeoutSec = options.timeout === undefined ? AGY_TIMEOUT_DEFAULT_SEC : /^\d+$/.test(String(options.timeout)) ? Number(options.timeout) : NaN;
   if (!(timeoutSec >= AGY_TIMEOUT_MIN_SEC && timeoutSec <= AGY_TIMEOUT_MAX_SEC)) return fail(`--timeout 必須是 ${AGY_TIMEOUT_MIN_SEC}..${AGY_TIMEOUT_MAX_SEC} 的整數（秒）`);
+  if (cfg.planner === "off") {
+    return emit(
+      { ...base(K, { reviewRoot: roots.reviewRoot, configRoot: roots.configRoot, prompt, output: null, outputRel: null, agy: null }), reason: "planner-off", error: "planner=off：Antigravity 規劃層已停用，由 Claude 自己寫計畫", fallback: "claude" },
+      options.json,
+      renderPlanArchitect
+    );
+  }
   if (!gitTopLevel(root)) return fail(`${root} 不是 git repo；機密閘門要靠 git 列舉工作區檔案，請先 git init`);
   const out = resolveOutputPath({ output: options.output, prompt, roots, cfg, force: Boolean(options.force) });
   if (out.error) return fail(out.error);
@@ -1098,6 +1141,7 @@ async function cmdQuota(argv) {
   const { options } = parseArgv(argv, { valueOptions: ["cwd", "threshold"], booleanOptions: ["json"] });
   const root = projectRoot(options.cwd);
   const { config: cfg } = loadConfig(root);
+  if (cfg.reviewer === "claude") return emit({ ok: true, kind: "quota", reason: null, disabled: true, reviewer: "claude", threshold: null, quota: null, error: null }, options.json, renderQuota);
   const threshold = options.threshold !== undefined ? Number(options.threshold) : cfg.quotaThreshold;
   const q = quotaView(await readQuota({ threshold }));
   const result = { ok: q.status !== "unknown", kind: "quota", reason: q.status === "unknown" ? "codex-error" : null, threshold, quota: q, error: q.error };
@@ -1172,15 +1216,21 @@ async function cmdPreflight(argv) {
   const root = projectRoot(options.cwd);
   const { config: cfg, source, warning } = loadConfig(root);
   const checks = [];
+  const claudeOnly = cfg.reviewer === "claude";
+  const skip = (name) => ({ name, required: false, status: "skip", detail: "reviewer=claude，已停用（不需要 Codex）" });
 
-  const comp = resolveCompanion();
-  checks.push({
-    name: "companion",
-    required: true,
-    status: comp.ok ? "ok" : "fail",
-    detail: comp.ok ? `codex@openai-codex ${comp.version}（${comp.installPath}）` : comp.error
-  });
+  const comp = claudeOnly ? { ok: false } : resolveCompanion();
+  if (claudeOnly) checks.push(skip("companion"));
+  else {
+    checks.push({
+      name: "companion",
+      required: true,
+      status: comp.ok ? "ok" : "fail",
+      detail: comp.ok ? `codex@openai-codex ${comp.version}（${comp.installPath}）` : comp.error
+    });
+  }
 
+  if (claudeOnly) checks.push(skip("codexCli"), skip("codexAuth"), skip("reviewGate"));
   if (comp.ok) {
     const r = runCompanion(["setup", "--json"], { cwd: root, scriptPath: comp.scriptPath, timeoutMs: 60_000 });
     const p = parseJsonLoose(r.stdout);
@@ -1209,34 +1259,54 @@ async function cmdPreflight(argv) {
   const top = gitTopLevel(root);
   checks.push({ name: "git", required: true, status: top ? "ok" : "fail", detail: top ? `git 根：${top}` : `${root} 不是 git repo`, fix: top ? undefined : "git init（不需 commit 或 remote）" });
 
-  let ws = windowsSandboxCheck();
-  if (ws.status !== "ok" && options["write-windows-sandbox"]) {
-    try {
-      writeWindowsSandbox(ws.file);
-      ws = { ...windowsSandboxCheck(), written: true };
-    } catch (err) {
-      ws = { ...ws, detail: `${ws.detail}；自動寫入失敗：${err.message}` };
+  if (claudeOnly) checks.push(skip("windowsSandbox"));
+  else {
+    let ws = windowsSandboxCheck();
+    if (ws.status !== "ok" && options["write-windows-sandbox"]) {
+      try {
+        writeWindowsSandbox(ws.file);
+        ws = { ...windowsSandboxCheck(), written: true };
+      } catch (err) {
+        ws = { ...ws, detail: `${ws.detail}；自動寫入失敗：${err.message}` };
+      }
     }
+    checks.push({ name: "windowsSandbox", required: true, ...ws });
   }
-  checks.push({ name: "windowsSandbox", required: true, ...ws });
 
-  const q = await quotaFor(cfg);
-  const tokenExpired = q.status === "unknown" && /token_expired|401 Unauthorized/.test(q.error || "");
-  if (tokenExpired) {
-    // codex login status 會說已登入，但後端已拒絕 token（升級方案、久未使用都會發生）
-    const auth = checks.find((c) => c.name === "codexAuth");
-    if (auth) {
-      auth.status = "fail";
-      auth.detail = "登入 token 已過期（後端回 401 token_expired），雖然 codex login status 顯示已登入";
-      auth.fix = "在終端機執行：codex logout 然後 codex login";
+  let q = null;
+  if (claudeOnly) checks.push(skip("quota"));
+  else {
+    q = await quotaFor(cfg);
+    const tokenExpired = q.status === "unknown" && /token_expired|401 Unauthorized/.test(q.error || "");
+    if (tokenExpired) {
+      // codex login status 會說已登入，但後端已拒絕 token（升級方案、久未使用都會發生）
+      const auth = checks.find((c) => c.name === "codexAuth");
+      if (auth) {
+        auth.status = "fail";
+        auth.detail = "登入 token 已過期（後端回 401 token_expired），雖然 codex login status 顯示已登入";
+        auth.fix = "在終端機執行：codex logout 然後 codex login";
+      }
     }
+    checks.push({
+      name: "quota",
+      required: false,
+      status: q.status === "exhausted" ? "warn" : q.status === "unknown" ? "warn" : "ok",
+      detail: tokenExpired ? "查詢失敗：token 過期（見 codexAuth）" : quotaMessage(q)
+    });
   }
-  checks.push({
-    name: "quota",
-    required: false,
-    status: q.status === "exhausted" ? "warn" : q.status === "unknown" ? "warn" : "ok",
-    detail: tokenExpired ? "查詢失敗：token 過期（見 codexAuth）" : quotaMessage(q)
-  });
+
+  // Antigravity 規劃層（選配）：只回報，不影響 ready
+  if (cfg.planner === "off") checks.push({ name: "planner", required: false, status: "skip", detail: "planner=off，Antigravity 規劃層已停用" });
+  else {
+    const a = findAgy();
+    checks.push({
+      name: "planner",
+      required: false,
+      status: a.ok ? "ok" : "warn",
+      detail: a.ok ? `Antigravity CLI agy（${a.bin}）` : "找不到 agy（選配；未裝時 plan-architect 自動降級為 Claude 自己寫計畫）",
+      fix: a.ok ? undefined : "curl -fsSL https://antigravity.google/cli/install.sh | bash 並登入；不想用就在設定檔設 \"planner\": \"off\""
+    });
+  }
 
   checks.push({ name: "config", required: false, status: warning ? "warn" : "ok", detail: warning ?? `${source === "defaults" ? "使用預設值" : source}` });
   const { checksSource, checksWarnings } = loadConfig(root);
@@ -1619,6 +1689,12 @@ function renderFindings(findings) {
 }
 
 function renderFailure(r) {
+  if (r.reason === "reviewer-claude") {
+    const lines = [`○ ${r.kind}：reviewer=claude，Codex 已停用 → 改走 Claude 自審 subagent`, `  Target: ${r.target?.label ?? "?"}${r.target?.base ? `（base ${r.target.base}）` : ""}`, `  Root: ${r.reviewRoot ?? "?"}`];
+    if (r.checks?.length) lines.push("  機械檢查：", renderChecks(r.checks));
+    for (const w of r.checksWarnings ?? []) lines.push(`  ⚠ ${w}`);
+    return `${lines.join("\n")}\n`;
+  }
   const lines = [`✗ ${r.kind} 失敗（reason=${r.reason}，attempts=${r.attempts}）`, `  ${r.error ?? "(無錯誤訊息)"}`];
   if (r.checks?.length) lines.push("  機械檢查：", renderChecks(r.checks));
   if (r.quota) lines.push(`  ${quotaMessage(r.quota)}`);
@@ -1642,6 +1718,7 @@ function renderRescue(r) {
 }
 
 function renderQuota(r) {
+  if (r.disabled) return "Codex 額度檢查已停用（reviewer=claude）\n";
   const q = r.quota;
   const lines = [quotaMessage(q), `  門檻 ${r.threshold}%`];
   if (q.secondary?.usedPercent !== undefined && q.secondary !== null) lines.push(`  secondary 窗口：${q.secondary.usedPercent}%${q.secondary.resetsAt ? `，重置 ${q.secondary.resetsAt}` : ""}`);
@@ -1649,7 +1726,7 @@ function renderQuota(r) {
 }
 
 function renderPreflight(r) {
-  const icon = { ok: "✓", warn: "⚠", fail: "✗" };
+  const icon = { ok: "✓", warn: "⚠", fail: "✗", skip: "－" };
   const lines = r.checks.map((c) => `${icon[c.status]} ${c.name.padEnd(15)} ${c.detail}${c.fix ? `\n    → ${c.fix.replace(/\n/g, "\n      ")}` : ""}${c.written ? "\n    （已自動寫入）" : ""}`);
   return `codex-dispatch preflight — ${r.ok ? "READY" : "NOT READY"}\n${lines.join("\n")}\n`;
 }

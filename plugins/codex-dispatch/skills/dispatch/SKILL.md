@@ -14,7 +14,13 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/dispatch.mjs" <子指令> --json ...
 ```
 
 子指令：`preflight`、`quota`、`plan-architect <prompt>`、`review`、`plan-review <file>`、`rescue [--write] <prompt>`、`state`、`snippet`。一律前景執行（不要 `run_in_background`），review 通常 30–120 秒，plan-architect 依專案大小 1–5 分鐘（預設逾時 600 秒）。
-設定檔 `<專案>/.claude/codex-dispatch.config.json`（缺檔用預設）：`quotaThreshold=95`、`lineThreshold=50`、`fileThreshold=3`、`maxRounds=3`、`onCodexUnavailable=auto`、`reviewMode=adversarial`、`planDir=plans`、`selfReview=auto`、`confidenceThreshold=0.75`。
+設定檔 `<專案>/.claude/codex-dispatch.config.json`（缺檔用預設）：`quotaThreshold=95`、`lineThreshold=50`、`fileThreshold=3`、`maxRounds=3`、`onCodexUnavailable=auto`、`reviewMode=adversarial`、`planDir=plans`、`selfReview=auto`、`confidenceThreshold=0.75`、`reviewer=codex`、`planner=auto`。
+
+## 審查者／規劃者開關（`reviewer`、`planner`）
+- `reviewer=codex`（預設）：本文件其餘規則照舊。
+- `reviewer=claude`：使用者明確選擇**不用 Codex**。`review`／`plan-review`／`rescue` 會回 `ok:false, reason:"reviewer-claude"`（不查額度、不佔輪次、不外送；`review` 仍先跑 checks，失敗照舊 `checks-failed`）。我看到 `reviewer-claude` 就直接開自審 subagent（下方「Claude 自審」節，A／B／C 對應變體），把回傳的 `target.label`／`target.base`／`reviewRoot`／`checks` 填進 prompt；findings 規則與 Codex 相同（critical/high 驗證後修、medium/low 交使用者），自審上限 2 輪。**這是使用者的設定，不是失敗：不記未審清單、不加「未經 Codex 審查」標題、回覆裡不特別標「自審」、「收工前」整節跳過；Stop hook 也依設定放行。** 只有 `reviewer=codex` 而 Codex 因額度／連線失敗的降級自審，才保留標記與未審清單。
+- `planner=auto`（預設）：有 agy 就先出草案。`planner=off`：`plan-architect` 回 `planner-off`，我直接自己寫計畫，不提 Antigravity。
+- 切到 `reviewer=claude` 前若未審清單有殘留，開場會提示；要清就 `state --clear`，不清也不會被擋。
 
 ## 分工
 - Claude（我）：規劃、架構、實作、套用修正。
@@ -23,12 +29,12 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/dispatch.mjs" <子指令> --json ...
 
 ## 觸發規則
 1. **估計**改動 > `lineThreshold` 行或 > `fileThreshold` 個檔案，或使用者直接說「先寫計畫」：
-   a. 先 `plan-architect "<需求：目標、限制、涉及範圍>" --json`（agy 唯讀讀工作區，草案寫到 `<planDir>/<slug>.md`；submodule 佈局加 `--cwd`；要指定檔名用 `--output`）。
+   a. 先 `plan-architect "<需求：目標、限制、涉及範圍>" --json`（agy 唯讀讀工作區，草案寫到 `<planDir>/<slug>.md`；submodule 佈局加 `--cwd`；要指定檔名用 `--output`）。`planner=off`（回 `planner-off`）→ 略過 a，直接自己寫計畫。
       - `ok=true` → 讀草案，**用我的判斷審閱修訂**：錯的檔案／API 引用改掉、缺的失敗情境補上、格式對齊「目標、涉及檔案、步驟、測試方式、不做什麼」；在計畫開頭保留「草案由 Antigravity 產出、Claude 修訂了什麼」一句。
       - `ok=false` 且 `reason` 是 `agy-not-installed`／`agy-error`／`invalid-output` → 一句告知使用者，**自己寫計畫**到 `<planDir>/<slug>.md`，不重試、不中斷、不記未審清單（這不是 Codex 失敗）。
       - `reason=local-error`（機密檔、路徑、不是 git repo）→ 依訊息請使用者處理；這輪同樣自己寫計畫繼續，不自行加 `--allow-secrets`。
-   b. `plan-review <planDir>/<slug>.md --json`。採納合理意見修訂計畫（在計畫尾端記一行審查紀錄），再開始實作。
-2. 實作完成（尚未 commit）：`review --json`（預設 adversarial 模式＋內建嚴重度校準：HIGH 只算單人正常操作會碰到的缺陷，多 session／極端時序最高 MEDIUM，confidence 低於門檻的另列 `lowConfidence` 不自動修，沒有 HIGH 就 approve）。
+   b. `plan-review <planDir>/<slug>.md --json`（`reviewer-claude` → 自審 B 變體）。採納合理意見修訂計畫（在計畫尾端記一行審查紀錄），再開始實作。
+2. 實作完成（尚未 commit）：`review --json`（`reviewer-claude` → 自審 A 變體，target 照回傳填；預設 adversarial 模式＋內建嚴重度校準：HIGH 只算單人正常操作會碰到的缺陷，多 session／極端時序最高 MEDIUM，confidence 低於門檻的另列 `lowConfidence` 不自動修，沒有 HIGH 就 approve）。
    - 送審範圍是整個 working tree：若 `git status` 顯示有**不是我這次改的**未提交變更，先告知使用者「這些會一起被審」；要只審某段就用 `--base <ref>`／`--scope branch`。
    - **submodule／多 repo 佈局**（例如 client 根下 `games/<game>/` 各是自己的 repo，而規則、plans/、設定都在 client 根）：CLI 用**雙根**——**審查根**＝改動所在的 repo（diff、HEAD、輪次以它為準），**規則根**＝從審查根往上找到的已接線目錄（設定檔、CLAUDE.md 規則、state 檔都在這）。我要做的只有一件事：review／plan-review／rescue／state 一律加 `--cwd <改動所在 repo 目錄>`（例如 `--cwd games/slot-fe-xxx`）。檔案引數（計畫檔、prompt 檔）相對我目前的 cwd 解析，放規則根的 `plans/` 即可。從上層 repo 送審 git 只看到子模組指標，CLI 會拒絕並提示；未初始化的 submodule 也會直接報錯要求 `git submodule update --init`。各 sub-repo 的 state／輪次／未審清單獨立，集中存在規則根 `.claude/state/codex-dispatch/`；在規則根跑 `state --list` 會列出全部。
    - CLI 會擋下疑似機密檔（.env、*.pem、credentials.json…），回 `local-error`：請使用者處理（移除／gitignore），不要自行加 `--allow-secrets`。
@@ -37,14 +43,14 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/dispatch.mjs" <子指令> --json ...
    - 上限 `maxRounds` 輪——**CLI 會強制**：同一批改動（repo + HEAD + 目標）送審達上限就回 `local-error`（訊息含 maxRounds）。**到頂就真的停：剩下的 critical/high 只呈現、不修**，由使用者決定；使用者說修 → 修完 commit 開新一輪正常審。不要「順手修掉再記未審」——那會製造永遠審不完的尾巴。不要加 `--reset-rounds` 自行續審。`verdict=approve` 或 commit 後自動開新一輪。
    - **同一 finding（file + title 相同）連續兩輪都出現 → 視為無進展，停止並交使用者裁決。**
    - `medium` / `low` / `lowConfidence`：列出交使用者決定，不自行修改。
-3. 同一個 bug 嘗試修復 2 次仍失敗：停止嘗試，`rescue "<症狀、已試過什麼、相關檔案>" --json`（唯讀）。Codex 回的診斷／patch 建議由我套用。
+3. 同一個 bug 嘗試修復 2 次仍失敗：停止嘗試，`rescue "<症狀、已試過什麼、相關檔案>" --json`（唯讀；`reviewer-claude` → 自審 C 變體）。Codex 回的診斷／patch 建議由我套用。
 4. 使用者說「嚴格審查」「上線前檢查」：`review --strict "<focus>" --json`（全對抗、不校準）。**只跑一次、不進迴圈**：結果整份呈現給使用者決定，不自動修（社群的「收斂後最終稽核」模式）。
 5. 小改動（字串、參數、樣式微調、註解、單檔 < 20 行）不送審。
 6. 官方 `codex-result-handling` skill 的「審完 STOP、不得自動修」規則**不適用**於本流程的 critical/high 自動修正；本 skill 優先。
 
 ## 結果物件（`--json`）
 ```
-ok, kind(review|plan-review|rescue|plan-architect), reason(null|quota|codex-error|invalid-output|local-error|checks-failed|agy-not-installed|agy-error),
+ok, kind(review|plan-review|rescue|plan-architect), reason(null|quota|codex-error|invalid-output|local-error|checks-failed|agy-not-installed|agy-error|reviewer-claude|planner-off),
 quota{status(available|exhausted|unknown), usedPercent, resetsAt, planType}, verdict, summary, findings[], nextSteps[], raw, error, attempts
 plan-architect 另有：output（計畫檔絕對路徑）、outputRel、agy{bin, model, effort, conversationId, durationMs}、fallback("claude" 表示請我自己寫計畫)
 ```
@@ -62,7 +68,7 @@ CLI 已內建：送審前查額度（`exhausted` 直接不送）、非額度失�
 `onCodexUnavailable=ask` → 全部 B；`continue` → 全部 C。
 `plan-architect` 失敗不在此表：它不是 Codex，失敗一律 C（自己寫計畫），不問、不記未審清單。
 
-### Claude 自審（Codex 不可用時的降級，不是替代）
+### Claude 自審（Codex 不可用時的降級；`reviewer=claude` 時則是正式審查者）
 - 用 `Agent` 工具開 **Explore**（唯讀）subagent，prompt 用 `${CLAUDE_PLUGIN_ROOT}/prompts/self-review.md` 的對應變體（diff／計畫／rescue；填 `{{TARGET}}`／`{{FOCUS}}`）。subagent 自己跑 git diff、自己讀檔；**不要**把我的摘要或辯解餵給它。subagent 回來後先 `git status --short` 確認 working tree 沒被它動過。
 - 回來的 JSON 照同一套 findings 規則處理（critical/high 修、medium/low 交使用者）。自審不消耗 Codex 輪次，自審自己上限 **2 輪**。
 - 自審過的條目仍在未審清單（`--self-reviewed`），額度恢復後仍建議補審；我不會因為自審過就把它當成已審。
@@ -70,6 +76,7 @@ CLI 已內建：送審前查額度（`exhausted` 直接不送）、非額度失�
 **絕不**因 Codex 失敗而無限重試、阻塞、或自行猜測 Codex 會說什麼。
 
 ## 收工前（每次任務結束、回覆使用者之前）
+0. `reviewer=claude` → 本節整個跳過（沒有 Codex 可補審，也不標記）。
 1. `state --list --json`。未審清單為空 → 正常收工。
 2. 非空 → `quota --json`。`available` → 對目前 working tree 跑一次 `review --json` 補審（仍受 maxRounds）。成功後只清除**這次審查確實涵蓋的條目**：條目的 `changedPaths` 仍在目前 working tree 且 `headSha` 相同 → `state --clear --id <id>`；已被 commit 走的條目不算涵蓋，保留並告知使用者。
 3. 仍失敗或額度未恢復 → 最終回覆最上方加醒目標題 **「⚠ 未經 Codex 審查」**（該條目若已自審，標題後加「（已由 Claude 自審）」），逐項列出：改了什麼、原因（額度用完／連線失敗）、重置時間、是否自審；建議使用者稍後 `/codex-dispatch:review`。清單**不會自動清除**（超過 24h 標示 STALE），只有補審成功或使用者明確說不審才 `state --clear`。

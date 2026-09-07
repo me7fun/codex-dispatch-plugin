@@ -92,9 +92,13 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
   "reviewMode": "adversarial",
   "planDir": "plans",
   "selfReview": "auto",
-  "confidenceThreshold": 0.75
+  "confidenceThreshold": 0.75,
+  "reviewer": "codex",
+  "planner": "auto"
 }
 ```
+- `reviewer`：`codex`（預設）｜`claude`——**只停用 Codex 審查與救援**：審 diff／審計畫／救援全改由 Claude 唯讀 subagent 自審（同一套 prompt 與 findings 規則，自審上限 2 輪）。這是你的決定，不是降級：不查額度、不佔輪次、不記未審清單、不加「未經 Codex 審查」標題、Stop hook 放行、`preflight` 把 Codex 相關檢查標為略過。沒裝 Codex 的人設這個就能用整套流程。
+- `planner`：`auto`（預設，有 `agy` 就先出草案）｜`off`（不用 Antigravity）。要**完全不碰外部 AI**要兩個都關：`{ "reviewer": "claude", "planner": "off" }`。
 - `confidenceThreshold`：Codex 給每條 finding 的信心低於此值 → 移到 `lowConfidence`，只呈現、不自動修、不影響 verdict。
 - `onCodexUnavailable`：`auto`（審 diff→繼續、審計畫/救援→詢問）｜`ask`（全部詢問）｜`continue`（全部繼續）
 - `selfReview`：Codex 不可用時的降級——`auto`（審 diff 失敗自動由 Claude 唯讀 subagent 自審）｜`ask`（每次先問）｜`off`。自審過的條目仍留在未審清單（標「[自審]」），額度恢復後仍建議補審。prompt 有三個變體（審 diff／審計畫／rescue 重新診斷）在 `prompts/self-review.md`。手動的 `/codex-dispatch:review` 不會自審，它只回報 Codex 結果。

@@ -1,8 +1,8 @@
-# Claude 自審 prompt（Codex 不可用時的降級方案）
+# Claude 自審 prompt（Codex 不可用時的降級方案；`reviewer=claude` 時的正式審查者）
 
 用 `Agent` 工具開一個 **Explore**（唯讀）subagent，把對應變體整段當 prompt 送進去。subagent 有自己的 context，不會繼承你這個 session 的假設，這是它能抓到你盲點的原因——**不要**在 prompt 裡替自己辯解或先講「我覺得沒問題」。subagent 回來後跑 `git status --short` 確認它沒動任何檔案。
 
-三個變體：**A. 審 diff**、**B. 審計畫**、**C. rescue 重新診斷**。`{{TARGET}}`／`{{FOCUS}}`／`{{PLAN_PATH}}`／`{{SYMPTOM}}` 等佔位符自行替換；沒有 focus 就刪掉那行。
+三個變體：**A. 審 diff**、**B. 審計畫**、**C. rescue 重新診斷**。`{{TARGET}}`／`{{ROOT}}`／`{{FOCUS}}`／`{{PLAN_PATH}}`／`{{SYMPTOM}}` 等佔位符自行替換；沒有 focus 就刪掉那行。`{{TARGET}}`／`{{ROOT}}` 一律照 CLI `--json` 回的 `target.label`／`target.base`／`reviewRoot` 填，不要自己猜（`--base`／`--scope branch` 的目標是 commit 之間的 diff，working tree 可能是空的）。
 
 輸出格式三者共用（放在每個變體最後）：
 
@@ -18,11 +18,14 @@ Severity guide: critical = data loss / security / silent wrong result in the mai
 
 You are an adversarial code reviewer standing in for an unavailable external reviewer. You did NOT write this code. Assume the author is competent but overconfident; your job is to find what they missed.
 
-Target: {{TARGET}} (e.g. "working tree diff" or "branch diff vs <base>")
+Target: {{TARGET}} — exactly one of: "working tree diff" | "branch diff vs <base>"
+Root: {{ROOT}} — run every git command inside this directory (it may be a nested repo, not the workspace root)
 Focus: {{FOCUS}}
 
 Procedure:
-1. Enumerate the change yourself: run `git status --short --untracked-files=all`, `git diff`, `git diff --cached`, and read every untracked file that is part of the change. Do not rely on any summary you are given.
+1. Enumerate the change yourself — do not rely on any summary you are given:
+   - Target "working tree diff": run `git status --short --untracked-files=all`, `git diff`, `git diff --cached`, and read every untracked file that is part of the change.
+   - Target "branch diff vs <base>": run `git diff --name-status <base>...HEAD` and `git diff <base>...HEAD`. Ignore uncommitted working-tree changes entirely — they are not the target, and on a clean branch the working tree diff is empty.
 2. For each changed file, look specifically for: incorrect assumptions about external tools/APIs, unchecked error paths, race conditions and TOCTOU, path/symlink/secret handling, off-by-one and boundary cases, silent failure that violates a stated guarantee, and behavior that contradicts the project's own documented rules (README, SKILL.md, plans/).
 3. Verify each suspected defect by reading the surrounding code; drop anything you cannot substantiate with a concrete failure scenario.
 4. Do NOT modify any file. Do NOT propose stylistic changes.

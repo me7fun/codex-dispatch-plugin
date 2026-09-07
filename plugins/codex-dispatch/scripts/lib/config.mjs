@@ -24,13 +24,17 @@ export const DEFAULTS = Object.freeze({
   reviewMode: "adversarial", // adversarial | native
   planDir: "plans",
   selfReview: "auto", // auto | ask | off：Codex 不可用時由 Claude subagent 自審
-  confidenceThreshold: 0.75 // 低於此信心的 finding 不進 findings（另列 lowConfidence，不自動修）
+  confidenceThreshold: 0.75, // 低於此信心的 finding 不進 findings（另列 lowConfidence，不自動修）
+  reviewer: "codex", // codex | claude：claude = 使用者選擇不用 Codex，審 diff／審計畫／救援全走 Claude 唯讀 subagent（不提醒、不記未審）
+  planner: "auto" // auto | off：off = 不用 Antigravity CLI 出規劃草案
 });
 
 const ENUMS = {
   onCodexUnavailable: ["auto", "ask", "continue"],
   reviewMode: ["adversarial", "native"],
-  selfReview: ["auto", "ask", "off"]
+  selfReview: ["auto", "ask", "off"],
+  reviewer: ["codex", "claude"],
+  planner: ["auto", "off"]
 };
 
 function pickInt(v, def, min = 0) {
@@ -69,7 +73,9 @@ export function loadConfig(root) {
     confidenceThreshold:
       typeof raw.confidenceThreshold === "number" && raw.confidenceThreshold >= 0 && raw.confidenceThreshold <= 1
         ? raw.confidenceThreshold
-        : DEFAULTS.confidenceThreshold
+        : DEFAULTS.confidenceThreshold,
+    reviewer: ENUMS.reviewer.includes(raw.reviewer) ? raw.reviewer : DEFAULTS.reviewer,
+    planner: ENUMS.planner.includes(raw.planner) ? raw.planner : DEFAULTS.planner
   };
   const local = loadLocalChecks(configRoot);
   config.checks = local.checks;

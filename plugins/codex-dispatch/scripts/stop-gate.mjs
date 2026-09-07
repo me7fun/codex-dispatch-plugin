@@ -10,6 +10,7 @@
  *   gate（Stop）：
  *     - stop_hook_active → 放行（防遞迴）
  *     - 本 session 沒 touched → 放行
+ *     - 設定 reviewer=claude（使用者選擇不用 Codex）→ 放行，state 不動
  *     - 讀規則根（CLAUDE_PROJECT_DIR → cwd）全部 state 檔的未審清單：
  *         空 → 放行
  *         非空 且 最終回覆在 code fence 外有獨立成行的「⚠ 未經 Codex 審查」標題 → 放行，記下已確認的清單摘要（digest）
@@ -22,6 +23,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import { loadConfig } from "./lib/config.mjs";
 
 const MAX_BLOCKS_PER_TURN = 2;
 // 整行必須就是標題：可帶引用符／#／粗體／⚠，後綴只允許「（N 筆）」「（已由 Claude 自審）」這類括號註記，行尾錨定——散文開頭湊巧相同不算
@@ -137,6 +139,17 @@ function gate(data) {
   const st = readFlag(p);
   if (!st.touched) return out({});
   const root = projectRoot(data);
+  // reviewer=claude：使用者選擇不用 Codex，「未經 Codex 審查」標題不適用 → 放行；state 保留不動（殘留條目由使用者決定要不要清）
+  let reviewer = "codex";
+  try {
+    reviewer = loadConfig(root).config.reviewer;
+  } catch {
+    reviewer = "codex";
+  }
+  if (reviewer === "claude") {
+    writeFlag(p, { touched: true, blockCount: 0, ackDigest: null });
+    return out({});
+  }
   const { entries, errors } = pendingEntries(root);
   if (entries.length === 0 && errors.length === 0) {
     writeFlag(p, { touched: true, blockCount: 0, ackDigest: null });
