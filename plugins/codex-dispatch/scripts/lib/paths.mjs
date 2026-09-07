@@ -112,6 +112,62 @@ export function gitSubmodulePaths(cwd) {
   return [...set].map((p) => p.replace(/\\/g, "/").replace(/\/$/, ""));
 }
 
+/**
+ * 外部 agent（例如 Antigravity `agy --add-dir <root>`）看得到的工作區檔案，給機密閘門用：
+ * - visible：tracked ＋ 未被忽略的 untracked（`git ls-files -co --exclude-standard`）
+ * - ignored：被 .gitignore 忽略的檔（`git ls-files -oi --exclude-standard`）——agy 實測不尊重 .gitignore，這些它照讀
+ * 兩者都遞迴進入已初始化的 submodule 與未登記的巢狀 repo（`git ls-files` 本身不會進去，agent 會）。
+ * 任何 git 失敗（含逾時、輸出溢出）回 {error}，呼叫端必須 fail-closed。
+ */
+export function gitWorkspaceFiles(root) {
+  const visible = [];
+  const ignored = [];
+  const seen = new Set();
+  const opts = (cwd) => ({ cwd, encoding: "utf8", windowsHide: true, timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
+  const list = (dir, args) => {
+    const r = spawnSync("git", args, opts(dir));
+    if (r.error || r.status !== 0) {
+      const why = r.error
+        ? r.error.code === "ETIMEDOUT"
+          ? "逾時 60s"
+          : r.error.code === "ENOBUFS"
+            ? "輸出超過 64MB"
+            : r.error.message
+        : (r.stderr || "").trim().split(/\r?\n/).slice(-1)[0] || `exit ${r.status}`;
+      return { error: `git ${args.slice(0, 2).join(" ")} 失敗（${dir}）：${why}` };
+    }
+    return { entries: r.stdout.split("\0").filter(Boolean) };
+  };
+  const walk = (dir, prefix, depth) => {
+    if (depth > 10) return `巢狀 repo 超過 10 層：${dir}`;
+    const key = canonicalPath(dir);
+    if (seen.has(key)) return null;
+    seen.add(key);
+    const v = list(dir, ["ls-files", "-co", "--exclude-standard", "-z"]);
+    if (v.error) return v.error;
+    const ig = list(dir, ["ls-files", "-oi", "--exclude-standard", "-z"]);
+    if (ig.error) return ig.error;
+    const nested = new Set(gitSubmodulePaths(dir));
+    for (const f of v.entries) {
+      if (f.endsWith("/")) nested.add(f.slice(0, -1)); // 未登記的巢狀 repo：ls-files -o 只列 dir/
+      else visible.push(prefix + f);
+    }
+    for (const f of ig.entries) {
+      if (f.endsWith("/")) nested.add(f.slice(0, -1));
+      else ignored.push(prefix + f);
+    }
+    for (const n of nested) {
+      const sub = path.join(dir, n);
+      if (!fs.existsSync(path.join(sub, ".git"))) continue; // 未初始化的 submodule：空目錄
+      const err = walk(sub, `${prefix}${n}/`, depth + 1);
+      if (err) return err;
+    }
+    return null;
+  };
+  const err = walk(root, "", 0);
+  return err ? { error: err } : { visible, ignored };
+}
+
 /** 路徑正規化：realpath（不存在則 resolve），Windows 忽略大小寫，統一 / 分隔。用於 state 檔命名與 root 比對。 */
 export function canonicalPath(p) {
   let out = path.resolve(p);

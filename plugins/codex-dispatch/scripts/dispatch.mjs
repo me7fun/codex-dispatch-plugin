@@ -16,6 +16,11 @@
  *                                 請 Codex 唯讀審計畫檔，要求回 JSON
  *   rescue [--write] [--model m] [--effort e] [--prompt-file f] [--allow-secrets] [prompt...]
  *                                 救援：預設唯讀（診斷＋建議 patch）；--write 才讓 Codex 改碼
+ *   plan-architect <prompt> [--output <file>] [--model m] [--effort low|medium|high] [--timeout sec] [--force] [--allow-secrets]
+ *                                 Antigravity CLI（agy）規劃層（選配）：`--mode plan` 唯讀讀取審查根、把規劃草案寫到 <規則根>/<planDir>/<slug>.md。
+ *                                 不碰 Codex（不查額度、不佔輪次、不記未審清單）。agy 不在 PATH → agy-not-installed；執行失敗／逾時／status≠SUCCESS／
+ *                                 工作區被改 → agy-error；回應空／讀檔被拒／沒有標題 → invalid-output（以上 exit 1，呼叫端降級為 Claude 自己寫計畫）。
+ *                                 機密閘門掃整個工作區（含 .gitignore 忽略的檔、submodule、巢狀 repo——agy 都讀得到）。
  *   state [--list] | --add-unreviewed <desc> [--reason r] [--kind k] [--scope s] [--error msg] [--self-reviewed] | --clear [--id x]
  *                                 未審清單（--self-reviewed：已由 Claude subagent 自審，仍未經 Codex）
  *   snippet [--write] [--target claude|local | --local]
@@ -26,14 +31,14 @@
  *                                 config / state 是使用者設定與工作流狀態，預設保留，要加旗標才刪；永不碰 plans/。
  *                                 plugin 本體另外用 claude plugin uninstall。
  *
- * exit code：0 成功；1 Codex 端失敗（quota / codex-error / invalid-output）；2 本地錯誤（local-error）
+ * exit code：0 成功；1 Codex／agy 端失敗（quota / codex-error / agy-not-installed / agy-error / invalid-output）；2 本地錯誤（local-error / checks-failed）
  */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { projectRoot, resolveRoots, gitTopLevel, gitHeadSha, gitChangedPathsForGate, gitDiffPathsForGate, gitSubmodulePaths, codexHomeDir } from "./lib/paths.mjs";
+import { projectRoot, resolveRoots, gitTopLevel, gitHeadSha, gitChangedPathsForGate, gitDiffPathsForGate, gitSubmodulePaths, gitWorkspaceFiles, canonicalPath, codexHomeDir } from "./lib/paths.mjs";
 import { resolveCompanion, runCompanion, parseJsonLoose, tailLines } from "./lib/companion.mjs";
 import { readQuota } from "./lib/quota.mjs";
 import { loadConfig, CONFIG_REL, LOCAL_CONFIG_REL, DEFAULTS } from "./lib/config.mjs";
@@ -210,12 +215,12 @@ function reviewPaths(root, { base, scope }) {
   return { paths: [...set], resolved, ref: wantBranch ? (base || null) : null };
 }
 
-/** 統一的機密閘門：所有會把內容送到 Codex 的指令都必須先過。回 null 表示可送。 */
-function secretGate(paths, allow) {
+/** 統一的機密閘門：所有會把內容送到外部模型（Codex／Antigravity）的指令都必須先過。回 null 表示可送。 */
+function secretGate(paths, allow, sink = "送 Codex（內容會送到 OpenAI）") {
   if (allow) return null;
   const hits = secretPaths(paths);
   if (!hits.length) return null;
-  return `疑似機密檔案，拒絕送 Codex（內容會送到 OpenAI）：${hits.join(", ")}。請先移除/加入 .gitignore，或確認無機密後加 --allow-secrets`;
+  return `疑似機密檔案，拒絕${sink}：${hits.join(", ")}。請先移除/加入 .gitignore，或確認無機密後加 --allow-secrets`;
 }
 
 /** 審查迴圈身分：同一 repo、同一 HEAD、同一目標 → 同一個 cycle；commit 後自動開新 cycle */
@@ -751,6 +756,334 @@ async function cmdRescue(argv) {
   result.reviewRoot = roots.reviewRoot;
   result.configRoot = roots.configRoot;
   emit(result, options.json, renderRescue);
+}
+
+// ---------- plan-architect（Antigravity CLI `agy` 規劃層：唯讀、可降級、不碰 Codex） ----------
+const AGY_TIMEOUT_DEFAULT_SEC = 600;
+const AGY_TIMEOUT_MIN_SEC = 5;
+const AGY_TIMEOUT_MAX_SEC = 1800;
+/** agy 自己的 --print-timeout 先到；父程序再多等這麼久才強制結束 */
+const AGY_PARENT_GRACE_MS = 5000;
+const AGY_MODEL_RE = /^[A-Za-z0-9._-]{1,80}$/;
+const AGY_EFFORTS = ["low", "medium", "high"];
+/** 測試與非標準安裝用：agy 可執行檔的絕對路徑；.js/.mjs/.cjs 結尾就用 node 跑 */
+const AGY_ENV_OVERRIDE = "CODEX_DISPATCH_AGY";
+const FINGERPRINT_HASH_MAX = 8 * 1024 * 1024;
+/** ignored 清單的例外：範本檔（node_modules 裡常見）不含祕密；visible 清單維持 review 同一套規則 */
+const SECRET_TEMPLATE_RE = /(^|\/)\.env\.(example|sample|template|dist)$/i;
+
+/**
+ * 找 agy：環境變數覆寫 → PATH（Windows 只認 .exe/.com；.cmd/.bat 在 Node ≥18.20 不能無 shell spawn，本指令永不用 shell）
+ * → %LOCALAPPDATA%\agy\bin（安裝器預設位置，既有 shell 的 PATH 不一定刷新過）。
+ */
+function findAgy() {
+  const override = process.env[AGY_ENV_OVERRIDE];
+  if (override) {
+    let ok = false;
+    try {
+      ok = path.isAbsolute(override) && fs.statSync(override).isFile();
+    } catch {
+      ok = false;
+    }
+    if (!ok) return { ok: false, reason: "agy-not-installed", error: `${AGY_ENV_OVERRIDE}=${override} 不是存在的絕對路徑檔案` };
+    return /\.(mjs|cjs|js)$/i.test(override) ? { ok: true, bin: override, cmd: process.execPath, args: [override] } : { ok: true, bin: override, cmd: override, args: [] };
+  }
+  const win = process.platform === "win32";
+  const exts = win ? [".exe", ".com"] : [""];
+  const dirs = String(process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  if (win && process.env.LOCALAPPDATA) dirs.push(path.join(process.env.LOCALAPPDATA, "agy", "bin"));
+  for (const dir of dirs) {
+    for (const ext of exts) {
+      const file = path.join(dir, `agy${ext}`);
+      try {
+        if (!fs.statSync(file).isFile()) continue;
+      } catch {
+        continue;
+      }
+      if (!win) {
+        try {
+          fs.accessSync(file, fs.constants.X_OK);
+        } catch {
+          continue;
+        }
+      }
+      return { ok: true, bin: file, cmd: file, args: [] };
+    }
+  }
+  return {
+    ok: false,
+    reason: "agy-not-installed",
+    error: "找不到 agy 指令（PATH 與 %LOCALAPPDATA%\\agy\\bin 都沒有）。安裝：curl -fsSL https://antigravity.google/cli/install.sh | bash 並登入；不裝也可以——plan-architect 會降級為 Claude 自己寫計畫"
+  };
+}
+
+/**
+ * 工作區指紋：porcelain 條目 ＋ 每個 dirty／untracked 檔的內容 sha1（>8MB 用 size+mtime），遞迴 submodule／巢狀 repo。
+ * 只比 porcelain 文字不夠：本來就 dirty 的檔再被改一次、既有 untracked 檔內容變了，狀態列完全一樣。
+ * ignored 檔不在指紋內（plan mode 本身不寫，這只是第三層偵測）。取不到回 null。
+ */
+function workspaceFingerprint(root) {
+  const h = crypto.createHash("sha1");
+  const seen = new Set();
+  const walk = (dir, prefix, depth) => {
+    if (depth > 10) return false;
+    const key = canonicalPath(dir);
+    if (seen.has(key)) return true;
+    seen.add(key);
+    const r = spawnSync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: dir, encoding: "utf8", windowsHide: true, timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
+    if (r.error || r.status !== 0) return false;
+    h.update(`${prefix}\n${r.stdout}\n`);
+    const fields = r.stdout.split("\0");
+    const files = [];
+    for (let i = 0; i < fields.length; i += 1) {
+      const f = fields[i];
+      if (!f) continue;
+      files.push(f.slice(3));
+      if (/[RC]/.test(f.slice(0, 2))) i += 1; // rename/copy：下一欄是原路徑，內容已在新路徑那筆
+    }
+    const nested = new Set(gitSubmodulePaths(dir));
+    for (const rel of files) {
+      if (rel.endsWith("/")) {
+        nested.add(rel.slice(0, -1)); // 未登記的巢狀 repo
+        continue;
+      }
+      const abs = path.join(dir, rel);
+      let st;
+      try {
+        st = fs.lstatSync(abs);
+      } catch {
+        h.update(`${rel}:missing\n`);
+        continue;
+      }
+      if (st.isDirectory()) continue;
+      if (st.isFile() && st.size <= FINGERPRINT_HASH_MAX) h.update(`${rel}:${crypto.createHash("sha1").update(fs.readFileSync(abs)).digest("hex")}\n`);
+      else h.update(`${rel}:${st.size}:${st.mtimeMs}\n`);
+    }
+    for (const n of nested) {
+      const sub = path.join(dir, n);
+      if (!fs.existsSync(path.join(sub, ".git"))) continue;
+      if (!walk(sub, `${prefix}${n}/`, depth + 1)) return false;
+    }
+    return true;
+  };
+  return walk(root, "", 0) ? h.digest("hex") : null;
+}
+
+/**
+ * 寫入目標（可能尚未存在）是否落在 root 內：找最近存在的祖先取 realpath 比對（symlink 由 realpath 解掉），
+ * 尚未存在的段落不得含 `.`/`..`。insideRoot 對不存在的路徑一律 false，不能直接用。
+ */
+function insideRootForWrite(root, abs) {
+  let cur = path.resolve(abs);
+  const pending = [];
+  while (!fs.existsSync(cur)) {
+    const parent = path.dirname(cur);
+    if (parent === cur) return false;
+    pending.unshift(path.basename(cur));
+    cur = parent;
+  }
+  if (pending.some((s) => s === "." || s === ".." || !s)) return false;
+  return insideRoot(root, cur);
+}
+
+function planSlug(prompt) {
+  const s = prompt
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40)
+    .replace(/-+$/, "");
+  if (s.length >= 3) return s;
+  const d = new Date();
+  const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+  return `plan-${ymd}-${crypto.randomBytes(2).toString("hex")}`;
+}
+
+/** 輸出檔：--output 相對呼叫者 cwd；預設 <規則根>/<planDir>/<slug>.md。必須 .md、在兩根之一內、非 symlink、不覆寫（除非 --force）。 */
+function resolveOutputPath({ output, prompt, roots, cfg, force }) {
+  const abs = output ? path.resolve(process.cwd(), output) : path.join(roots.configRoot, cfg.planDir, `${planSlug(prompt)}.md`);
+  if (!/\.md$/i.test(abs)) return { error: `輸出檔必須是 .md：${abs}` };
+  const owner = [roots.reviewRoot, roots.configRoot].find((r) => insideRootForWrite(r, abs));
+  if (!owner) return { error: `輸出檔必須在審查根（${roots.reviewRoot}）或規則根（${roots.configRoot}）內：${abs}` };
+  const symlinkErr = refuseSymlink(abs);
+  if (symlinkErr) return { error: symlinkErr };
+  if (fs.existsSync(abs)) {
+    if (!fs.statSync(abs).isFile()) return { error: `不是一般檔案：${abs}` };
+    if (!force) return { error: `輸出檔已存在：${abs}（要覆寫加 --force，或用 --output 指定別的檔名）` };
+  }
+  return { abs, rel: path.relative(owner, abs).split(path.sep).join("/") };
+}
+
+function buildArchitectPrompt(request) {
+  return [
+    "You are a senior software architect acting as a READ-ONLY planning assistant for a coding agent.",
+    "Produce an implementation plan for the request below, grounded in the repository in the current workspace. Read as much of the codebase as you need.",
+    "",
+    "Hard rules:",
+    "- READ-ONLY: do not create, modify, or delete any file; do not run shell commands. You are in plan mode; writes are blocked anyway.",
+    "- Output the plan DIRECTLY IN YOUR RESPONSE TEXT as Markdown (not as a file or artifact): no preamble, no closing remarks, no code fence wrapping the whole document. Start with a level-1 title line.",
+    "- Write the plan in the same language as the request.",
+    "- Use exactly these level-2 sections in this order: 目標 / 涉及檔案 / 步驟 / 測試方式 / 不做什麼 / 風險與未知.",
+    "- Reference existing files, functions and dependencies by their real relative paths and names; do not invent APIs. Mark anything you could not verify as (未驗證).",
+    "- Prefer the minimal change set: no rewrites, no opportunistic refactors. Do not include full code listings (short snippets of at most 10 lines are fine).",
+    "",
+    "----- REQUEST BEGIN -----",
+    request,
+    "----- REQUEST END -----"
+  ].join("\n");
+}
+
+function runAgy(found, { root, prompt, model, effort, timeoutSec }) {
+  const args = [...found.args, "--add-dir", root, "--mode", "plan", "--output-format", "json", "--print-timeout", `${timeoutSec}s`];
+  if (model) args.push("--model", model);
+  if (effort) args.push("--effort", effort);
+  args.push("-p", prompt); // -p 永遠最後：agy 的 -p 把下一個 token 當 prompt，放前面會吃掉其他旗標
+  const started = Date.now();
+  const r = spawnSync(found.cmd, args, { cwd: root, encoding: "utf8", timeout: timeoutSec * 1000 + AGY_PARENT_GRACE_MS, maxBuffer: 64 * 1024 * 1024, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  const timedOut = Boolean(r.error && r.error.code === "ETIMEDOUT");
+  return {
+    status: r.status,
+    signal: r.signal ?? null,
+    stdout: r.stdout || "",
+    stderr: r.stderr || "",
+    error: r.error ? (timedOut ? `agy 逾時（${timeoutSec}s ＋ ${AGY_PARENT_GRACE_MS / 1000}s）` : r.error.message) : null,
+    durationMs: Date.now() - started
+  };
+}
+
+/** 解析 agy --output-format json；plan mode 偶爾只回「已產生計畫（連結）」，沒有標題就當 invalid-output 交呼叫端降級。 */
+function interpretAgy(r) {
+  const errTail = tailLines(r.stderr);
+  if (r.error) return { ok: false, reason: "agy-error", error: `${r.error}${errTail ? `；stderr：${errTail}` : ""}` };
+  if (r.status !== 0 || r.signal) return { ok: false, reason: "agy-error", error: errTail || tailLines(r.stdout) || `agy exit ${r.status ?? r.signal}`, raw: r.stdout || null };
+  const payload = parseJsonLoose(r.stdout);
+  if (!payload || typeof payload !== "object" || !("status" in payload || "response" in payload)) {
+    return { ok: false, reason: "invalid-output", error: `agy 輸出不是預期的 JSON${errTail ? `；stderr：${errTail}` : ""}`, raw: r.stdout || null };
+  }
+  if (payload.status !== "SUCCESS") {
+    return { ok: false, reason: "agy-error", error: `agy status ${payload.status ?? "?"}${payload.error ? `：${payload.error}` : ""}${errTail ? `；stderr：${errTail}` : ""}`, raw: r.stdout };
+  }
+  const denied = Array.isArray(payload.denied_actions) ? payload.denied_actions.map((d) => d && d.action).filter(Boolean) : [];
+  const response = typeof payload.response === "string" ? payload.response.trim() : "";
+  if (denied.includes("read_file")) return { ok: false, reason: "invalid-output", error: `agy 讀檔被拒（denied_actions: ${denied.join(", ")}）；工作區沒被加入？`, raw: r.stdout };
+  if (!response) return { ok: false, reason: "invalid-output", error: `agy 回應空白${denied.length ? `（denied_actions: ${denied.join(", ")}）` : ""}${errTail ? `；stderr：${errTail}` : ""}`, raw: r.stdout };
+  if (!/^#{1,6}\s+\S/m.test(response)) return { ok: false, reason: "invalid-output", error: "agy 回應沒有任何 Markdown 標題，不像計畫（plan mode 有時只回「已產生計畫」連結）", raw: r.stdout };
+  return { ok: true, response, conversationId: typeof payload.conversation_id === "string" ? payload.conversation_id : null, durationSeconds: typeof payload.duration_seconds === "number" ? payload.duration_seconds : null, usage: payload.usage ?? null, deniedActions: denied };
+}
+
+/** agy 的回應把檔名包成 [name](file:///C:/abs#L1)；計畫檔要純文字 */
+function flattenFileLinks(text) {
+  return text.replace(/\[([^\]]+)\]\(file:\/\/[^)]*\)/g, "$1");
+}
+
+/** 把 agy 回應整理成標準計畫檔：標題、來源前言、本體、審查紀錄段（plan-review 後由 Claude 補一行）。 */
+function formatPlanMarkdown({ response, prompt, conversationId, durationMs }) {
+  let body = flattenFileLinks(response).replace(/\r\n/g, "\n").trim();
+  const fence = body.match(/^```[a-zA-Z]*\n([\s\S]*?)\n```$/);
+  if (fence) body = fence[1].trim();
+  const lines = body.split("\n");
+  const titleIdx = lines.findIndex((l) => /^#\s+\S/.test(l));
+  const head = prompt.replace(/\s+/g, " ").trim();
+  const title = titleIdx >= 0 ? lines[titleIdx] : `# 計畫：${head.slice(0, 60)}${head.length > 60 ? "…" : ""}`;
+  const rest = (titleIdx >= 0 ? [...lines.slice(0, titleIdx), ...lines.slice(titleIdx + 1)] : lines).join("\n").trim();
+  const meta = [
+    `> Antigravity CLI 規劃草案（codex-dispatch plan-architect）。conversation：${conversationId ?? "未知"}；產出：${new Date().toISOString()}；耗時 ${Math.round(durationMs / 1000)}s。`,
+    "> 草案僅供 Claude 審閱修訂，並需經 Codex plan-review 後才作為實作依據。",
+    `> 需求：${head.length > 200 ? `${head.slice(0, 200)}…` : head}`
+  ];
+  let doc = [title, "", ...meta, "", rest].join("\n").trim();
+  if (!/^##\s+計畫審查紀錄\s*$/m.test(doc)) doc += "\n\n## 計畫審查紀錄\n- （尚未經 Codex plan-review）";
+  return `${doc}\n`;
+}
+
+async function cmdPlanArchitect(argv) {
+  const { options, positionals } = parseArgv(argv, {
+    valueOptions: ["cwd", "output", "model", "effort", "timeout"],
+    booleanOptions: ["json", "force", "allow-secrets"]
+  });
+  const K = "plan-architect";
+  const fail = (error, extra) => emit(localError(K, error, extra), options.json, renderPlanArchitect);
+  const roots = rootsOrFail(K, options, renderPlanArchitect);
+  if (!roots) return;
+  const root = roots.reviewRoot;
+  const { config: cfg } = loadConfig(root);
+  const prompt = positionals.join(" ").trim();
+  if (!prompt) return fail("缺少需求描述：plan-architect <prompt> [--output <file>]");
+  if (options.model !== undefined && !AGY_MODEL_RE.test(options.model)) return fail("--model 只接受字母、數字、. _ -（最長 80 字）");
+  if (options.effort !== undefined && !AGY_EFFORTS.includes(options.effort)) return fail(`--effort 只接受 ${AGY_EFFORTS.join("|")}`);
+  const timeoutSec = options.timeout === undefined ? AGY_TIMEOUT_DEFAULT_SEC : /^\d+$/.test(String(options.timeout)) ? Number(options.timeout) : NaN;
+  if (!(timeoutSec >= AGY_TIMEOUT_MIN_SEC && timeoutSec <= AGY_TIMEOUT_MAX_SEC)) return fail(`--timeout 必須是 ${AGY_TIMEOUT_MIN_SEC}..${AGY_TIMEOUT_MAX_SEC} 的整數（秒）`);
+  if (!gitTopLevel(root)) return fail(`${root} 不是 git repo；機密閘門要靠 git 列舉工作區檔案，請先 git init`);
+  const out = resolveOutputPath({ output: options.output, prompt, roots, cfg, force: Boolean(options.force) });
+  if (out.error) return fail(out.error);
+  // 機密閘門：agy 讀整個 --add-dir 工作區（含 .gitignore 忽略的檔、submodule、巢狀 repo），列不出來就拒絕
+  const listed = gitWorkspaceFiles(root);
+  if (listed.error) return fail(`無法列舉工作區檔案（機密閘門 fail-closed）：${listed.error}`);
+  const scan = [...listed.visible, ...listed.ignored.filter((p) => !SECRET_TEMPLATE_RE.test(p))];
+  const gate = secretGate(scan, options["allow-secrets"], "交給 Antigravity（agy 會讀整個工作區，含 .gitignore 忽略的檔，內容會送到 Google）");
+  if (gate) return fail(gate);
+
+  const common = { reviewRoot: roots.reviewRoot, configRoot: roots.configRoot, prompt, output: null, outputRel: null, fallback: null, agy: null };
+  const found = findAgy();
+  if (!found.ok) return emit({ ...base(K, common), reason: found.reason, error: found.error, fallback: "claude" }, options.json, renderPlanArchitect);
+
+  const before = workspaceFingerprint(root);
+  if (before === null) return fail("無法取得工作區指紋（執行前）：git status 失敗");
+  const r = runAgy(found, { root, prompt: buildArchitectPrompt(prompt), model: options.model, effort: options.effort, timeoutSec });
+  const result = base(K, { ...common, attempts: 1, agy: { bin: found.bin, model: options.model ?? null, effort: options.effort ?? null, conversationId: null, durationMs: r.durationMs, timeoutSec, usage: null } });
+  // 第三層：agy 應該只讀；工作區有任何變動就不採用它的輸出
+  const after = workspaceFingerprint(root);
+  if (after === null || after !== before) {
+    result.reason = "agy-error";
+    result.error = after === null ? "無法取得工作區指紋（執行後）：git status 失敗" : "Antigravity 執行後工作區有變動（plan mode 應該只讀）；不採用其輸出，請用 git status 檢查並還原";
+    result.fallback = "claude";
+    return emit(result, options.json, renderPlanArchitect);
+  }
+  const it = interpretAgy(r);
+  if (!it.ok) {
+    Object.assign(result, { reason: it.reason, error: it.error, raw: it.raw ?? null, fallback: "claude" });
+    return emit(result, options.json, renderPlanArchitect);
+  }
+  const doc = formatPlanMarkdown({ response: it.response, prompt, conversationId: it.conversationId, durationMs: r.durationMs });
+  const tmp = `${out.abs}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(out.abs), { recursive: true });
+    if (options.force) {
+      fs.writeFileSync(tmp, doc, "utf8");
+      const symlinkErr = refuseSymlink(out.abs);
+      if (symlinkErr) throw new Error(symlinkErr);
+      fs.renameSync(tmp, out.abs);
+    } else {
+      fs.writeFileSync(out.abs, doc, { encoding: "utf8", flag: "wx" }); // exclusive create：agy 跑了幾分鐘期間若有人建了同名檔，不覆蓋
+    }
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* ignore */
+    }
+    return fail(err.code === "EEXIST" ? `輸出檔在執行期間被建立，未覆蓋：${out.abs}（要覆寫加 --force）` : `寫入計畫檔失敗：${err.message}`);
+  }
+  Object.assign(result, { ok: true, output: out.abs, outputRel: out.rel, raw: it.response });
+  Object.assign(result.agy, { conversationId: it.conversationId, usage: it.usage, deniedActions: it.deniedActions });
+  result.nextSteps = [`審閱並修訂草案：${out.rel}`, `送 Codex 審計畫：plan-review ${out.rel} --json`];
+  emit(result, options.json, renderPlanArchitect);
+}
+
+function renderPlanArchitect(r) {
+  if (!r.ok) {
+    const lines = [`✗ plan-architect 失敗（reason=${r.reason}）`, `  ${r.error ?? "(無錯誤訊息)"}`];
+    if (r.fallback === "claude") lines.push("  → 降級：由 Claude 自己寫計畫（流程不中斷）");
+    return `${lines.join("\n")}\n`;
+  }
+  let preview = "";
+  try {
+    preview = fs.readFileSync(r.output, "utf8").split("\n").slice(0, 20).join("\n");
+  } catch {
+    preview = "";
+  }
+  const a = r.agy ?? {};
+  return `# Antigravity plan-architect\nOutput: ${r.output}\nagy: ${a.bin ?? "?"}  model=${a.model ?? "default"}  effort=${a.effort ?? "default"}  ${Math.round((a.durationMs ?? 0) / 1000)}s  conversation=${a.conversationId ?? "?"}\n\n${preview}\n…\n\n## Next steps\n${(r.nextSteps ?? []).map((s) => `- ${s}`).join("\n")}\n`;
 }
 
 // ---------- resolve / quota / preflight ----------
@@ -1352,6 +1685,8 @@ async function main() {
       return cmdPlanReview(rest);
     case "rescue":
       return cmdRescue(rest);
+    case "plan-architect":
+      return cmdPlanArchitect(rest);
     case "state":
       return cmdState(rest);
     case "snippet":

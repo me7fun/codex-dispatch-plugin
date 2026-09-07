@@ -76,7 +76,7 @@ try {
   const lines = wired
     ? [
         "[codex-dispatch] 本專案啟用「Claude 寫、Codex 審」：",
-        "- 估計改動 >50 行或 >3 檔（或使用者說「先寫計畫」）→ 先寫計畫並送 Codex 審計畫，再實作。",
+        "- 估計改動 >50 行或 >3 檔（或使用者說「先寫計畫」）→ 先 `plan-architect`（Antigravity CLI `agy` 唯讀出草案；未裝或失敗就自己寫）→ 審閱修訂 → 送 Codex 審計畫 → 再實作。",
         "- 實作完成 → 送 Codex 審 diff；critical/high 修正後重審（上限 3 輪），medium/low 交使用者決定。",
         "- 同一 bug 修 2 次失敗 → 交 Codex 救援（唯讀診斷）。小改動不送審。",
         "- Codex 失敗絕不阻塞：審 diff 失敗記入未審清單、繼續；審計畫/救援失敗詢問使用者。收工前補審或逐項標記。",

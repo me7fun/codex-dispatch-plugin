@@ -13,16 +13,20 @@ user-invocable: false
 node "${CLAUDE_PLUGIN_ROOT}/scripts/dispatch.mjs" <子指令> --json ...
 ```
 
-子指令：`preflight`、`quota`、`review`、`plan-review <file>`、`rescue [--write] <prompt>`、`state`、`snippet`。一律前景執行（不要 `run_in_background`），review 通常 30–120 秒。
+子指令：`preflight`、`quota`、`plan-architect <prompt>`、`review`、`plan-review <file>`、`rescue [--write] <prompt>`、`state`、`snippet`。一律前景執行（不要 `run_in_background`），review 通常 30–120 秒，plan-architect 依專案大小 1–5 分鐘（預設逾時 600 秒）。
 設定檔 `<專案>/.claude/codex-dispatch.config.json`（缺檔用預設）：`quotaThreshold=95`、`lineThreshold=50`、`fileThreshold=3`、`maxRounds=3`、`onCodexUnavailable=auto`、`reviewMode=adversarial`、`planDir=plans`、`selfReview=auto`、`confidenceThreshold=0.75`。
 
 ## 分工
 - Claude（我）：規劃、架構、實作、套用修正。
+- Antigravity CLI `agy`（選配）：只出**規劃草案**，`--mode plan` 唯讀讀整個工作區；草案由我審閱修訂，不是命令。沒裝就當它不存在。
 - Codex：審計畫、審 diff、深度找 bug、救援診斷。**只審不寫**——除非使用者明說「讓 Codex 直接改」，否則不加 `--write`。
 
 ## 觸發規則
 1. **估計**改動 > `lineThreshold` 行或 > `fileThreshold` 個檔案，或使用者直接說「先寫計畫」：
-   a. 寫計畫到 `<planDir>/<slug>.md`（目標、涉及檔案、步驟、測試方式、不做什麼）。
+   a. 先 `plan-architect "<需求：目標、限制、涉及範圍>" --json`（agy 唯讀讀工作區，草案寫到 `<planDir>/<slug>.md`；submodule 佈局加 `--cwd`；要指定檔名用 `--output`）。
+      - `ok=true` → 讀草案，**用我的判斷審閱修訂**：錯的檔案／API 引用改掉、缺的失敗情境補上、格式對齊「目標、涉及檔案、步驟、測試方式、不做什麼」；在計畫開頭保留「草案由 Antigravity 產出、Claude 修訂了什麼」一句。
+      - `ok=false` 且 `reason` 是 `agy-not-installed`／`agy-error`／`invalid-output` → 一句告知使用者，**自己寫計畫**到 `<planDir>/<slug>.md`，不重試、不中斷、不記未審清單（這不是 Codex 失敗）。
+      - `reason=local-error`（機密檔、路徑、不是 git repo）→ 依訊息請使用者處理；這輪同樣自己寫計畫繼續，不自行加 `--allow-secrets`。
    b. `plan-review <planDir>/<slug>.md --json`。採納合理意見修訂計畫（在計畫尾端記一行審查紀錄），再開始實作。
 2. 實作完成（尚未 commit）：`review --json`（預設 adversarial 模式＋內建嚴重度校準：HIGH 只算單人正常操作會碰到的缺陷，多 session／極端時序最高 MEDIUM，confidence 低於門檻的另列 `lowConfidence` 不自動修，沒有 HIGH 就 approve）。
    - 送審範圍是整個 working tree：若 `git status` 顯示有**不是我這次改的**未提交變更，先告知使用者「這些會一起被審」；要只審某段就用 `--base <ref>`／`--scope branch`。
@@ -40,10 +44,11 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/dispatch.mjs" <子指令> --json ...
 
 ## 結果物件（`--json`）
 ```
-ok, kind(review|plan-review|rescue), reason(null|quota|codex-error|invalid-output|local-error),
+ok, kind(review|plan-review|rescue|plan-architect), reason(null|quota|codex-error|invalid-output|local-error|checks-failed|agy-not-installed|agy-error),
 quota{status(available|exhausted|unknown), usedPercent, resetsAt, planType}, verdict, summary, findings[], nextSteps[], raw, error, attempts
+plan-architect 另有：output（計畫檔絕對路徑）、outputRel、agy{bin, model, effort, conversationId, durationMs}、fallback("claude" 表示請我自己寫計畫)
 ```
-exit code：0 成功；1 Codex 端失敗；2 本地錯誤（先修環境，例如未安裝官方 plugin、不是 git repo）。
+exit code：0 成功；1 Codex／agy 端失敗；2 本地錯誤（先修環境，例如未安裝官方 plugin、不是 git repo）。
 
 ## 失敗處理（最重要）
 CLI 已內建：送審前查額度（`exhausted` 直接不送）、非額度失敗自動重試 1 次、失敗後再查一次額度判因。我收到 `ok=false` 後**不再重試**，依 `reason` 與呼叫類型處理：
@@ -55,6 +60,7 @@ CLI 已內建：送審前查額度（`exhausted` 直接不送）、非額度失�
 | 救援（rescue） | **B：詢問** | 同上，但第一個選項是「改由 Claude subagent **重新診斷**（不是審 diff）後繼續」——用 self-review.md 的 rescue 變體。無法提問的環境：停止並回報卡住的 bug，不自行猜。 |
 
 `onCodexUnavailable=ask` → 全部 B；`continue` → 全部 C。
+`plan-architect` 失敗不在此表：它不是 Codex，失敗一律 C（自己寫計畫），不問、不記未審清單。
 
 ### Claude 自審（Codex 不可用時的降級，不是替代）
 - 用 `Agent` 工具開 **Explore**（唯讀）subagent，prompt 用 `${CLAUDE_PLUGIN_ROOT}/prompts/self-review.md` 的對應變體（diff／計畫／rescue；填 `{{TARGET}}`／`{{FOCUS}}`）。subagent 自己跑 git diff、自己讀檔；**不要**把我的摘要或辯解餵給它。subagent 回來後先 `git status --short` 確認 working tree 沒被它動過。

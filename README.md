@@ -23,7 +23,7 @@ Claude Code plugin：**「Claude 寫、Codex 審」的調度規則**。
 
 | 情境 | 行為 |
 |---|---|
-| 估計改動 >50 行或 >3 檔 | 先寫計畫 → Codex 審計畫 → 採納後才實作 |
+| 估計改動 >50 行或 >3 檔 | **Antigravity CLI 先出規劃草案**（選配、唯讀；沒裝或失敗就自動降級為 Claude 自己寫）→ Claude 審閱修訂 → Codex 審計畫 → 採納後才實作 |
 | 實作完成 | Codex 審 diff（結構化 findings，**內建嚴重度校準**：HIGH 只算單人正常操作會碰到的缺陷、低信心 finding 另列不自動修、沒有 HIGH 即 approve）：critical/high **先驗證能複現再修**、重審（上限 3 輪；到頂剩下的只呈現不修，交使用者）；medium/low 交使用者 |
 | 同一 bug 修 2 次失敗 | 交 Codex 救援（唯讀診斷，Claude 套用建議） |
 | 使用者說「嚴格審查」 | `--strict` 全對抗 review（不校準），**只跑一次**當最終稽核，不進迴圈 |
@@ -47,7 +47,8 @@ Claude Code plugin：**「Claude 寫、Codex 審」的調度規則**。
 - **規則根** = 從審查根往上找到的已接線目錄：設定檔、CLAUDE.md 規則、`plans/`、以及**所有 sub-repo 的 state** 都在這（`.claude/state/codex-dispatch/<game>-<hash>.json`，game repo 裡不留任何檔）。
 - 從上層 repo 送審只看得到子模組指標 → CLI 拒絕並提示 `--cwd`；未初始化的 submodule → 提示 `git submodule update --init`。
 - 各 game 的輪次、未審清單獨立，多視窗同時開發不同 game 互不影響；在規則根 `/codex-dispatch:status` 會列出全部。
-5. **Windows 必做**：`~/.codex/config.toml` 加入
+5. **選配**：Antigravity CLI `agy`（`curl -fsSL https://antigravity.google/cli/install.sh | bash`，跑一次 `agy` 完成 Google 登入）——裝了就多一層「Antigravity 規劃草案」；沒裝流程完全不變。不需要 MCP、不需要 plugin。見下方「Antigravity 規劃層」。
+6. **Windows 必做**：`~/.codex/config.toml` 加入
    ```toml
    [windows]
    sandbox = "unelevated"
@@ -112,6 +113,21 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 - 此檔被 git 追蹤時整組停用並警告；最多 10 條、逾時 10–1800 秒；失敗回 `reason=checks-failed`（exit 2）。
 - 只在 adversarial 模式會把結果附進 prompt；native 模式只當閘門。`--skip-checks` 跳過（Claude 只在你明說時用）。
 
+## Antigravity 規劃層（選配）
+
+三方協同：**Antigravity 規劃 → Codex 審計畫 → Claude 實作 → Codex 審 diff**。Antigravity CLI（`agy`）只負責「讀整個專案、出一份規劃草案」，其餘全部照舊。
+
+| | |
+|---|---|
+| 觸發 | 改動估計 >50 行或 >3 檔時，Claude 先跑 `dispatch.mjs plan-architect "<需求>"`，草案寫到 `<規則根>/plans/<slug>.md`，Claude 審閱修訂後再送 `plan-review` |
+| 怎麼跑 | `agy --add-dir <審查根> --mode plan --output-format json --print-timeout <sec>s -p "<prompt>"`，無 shell、`-p` 固定放最後（agy 的 `-p` 會把下一個 token 當 prompt） |
+| 唯讀怎麼保證 | ① `--mode plan`：實測 headless 下不寫 repo（只在 `~/.gemini/antigravity-cli/brain/` 留副本），連 `--dangerously-skip-permissions` 都擋得住；**預設模式加 `--add-dir` 會真的寫檔，所以永遠不用**；② shell 指令 headless 一律自動拒絕；③ 執行前後比對工作區指紋（porcelain 條目＋dirty/untracked 檔內容 sha1），有變動就不採用輸出 |
+| 降級條件 | `agy` 不在 PATH 也不在 `%LOCALAPPDATA%\agy\bin`（`reason=agy-not-installed`）、執行失敗／逾時／`status≠SUCCESS`／工作區被改（`agy-error`）、回應空白／讀檔被拒／沒有標題（`invalid-output`）→ `ok:false`，Claude 一句告知後**自己寫計畫**，不重試、不中斷、不記未審清單 |
+| 機密 | **agy 不尊重 `.gitignore`**（實測讀得出 gitignored `.env` 與忽略目錄內的檔）。執行前列舉整個工作區：tracked ＋ untracked ＋ **ignored**，遞迴 submodule 與巢狀 repo；命中機密樣式就拒絕（`local-error`）。ignored 清單放過 `.env.example/.sample/.template/.dist` 範本檔 |
+| 不做 | 不查 Antigravity 額度、不自動接著跑 plan-review（每步可見）、不加設定鍵（要關掉就別裝 agy）、不代改 `~/.gemini/antigravity-cli/settings.json` |
+
+非標準安裝可設環境變數 `CODEX_DISPATCH_AGY=<agy 絕對路徑>`。
+
 ## 收工兜底（Stop hook）
 
 本 session 用過 dispatch 且未審清單非空時，最終回覆必須有「⚠ 未經 Codex 審查」標題，否則 Stop hook 擋下要求補上（同一輪最多擋 2 次）。**它只看文字與本機 state，零 Codex 呼叫**——跟官方 review gate 撞限額無限迴圈的問題無關。同一批未審標過一次後不再重複擋。
@@ -119,12 +135,13 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 ## 底層 CLI
 
 所有 Codex 呼叫走 `plugins/codex-dispatch/scripts/dispatch.mjs`（`--json` 回統一結果物件；exit 0 成功、1 Codex 端失敗、2 本地錯誤）：
-`resolve` / `quota` / `preflight` / `review` / `plan-review <file>` / `rescue [--write] <prompt>` / `state` / `snippet` / `unwire`。
+`resolve` / `quota` / `preflight` / `plan-architect <prompt> [--output f]` / `review` / `plan-review <file>` / `rescue [--write] <prompt>` / `state` / `snippet` / `unwire`。
 它會從 `~/.claude/plugins/installed_plugins.json` 找官方 plugin 的 `codex-companion.mjs` 直接執行——因為官方 review 類 slash command 設了 `disable-model-invocation`，Claude 自己呼叫不到。
 
 ## 資料與安全
 
 - Codex review 會把 **diff 內容**（含未 commit、未追蹤的檔案）送到 OpenAI；plan-review 送計畫全文。
+- `plan-architect` 讓 Antigravity CLI 讀**整個工作區**（它自己決定讀哪些檔，且不看 `.gitignore`），內容送到 Google；執行前先過同一套機密閘門（含 ignored、submodule、巢狀 repo）。
 - CLI 送審前會擋下疑似機密檔（`.env*`、`*.pem/*.key`、`credentials.json`、`auth.json`、`.npmrc`…），回 `local-error`；確認無機密才加 `--allow-secrets`。
 - `plan-review` / `--prompt-file` 只接受專案根目錄內的一般檔案（realpath 比對，擋 symlink 逃逸）。
 - 未審清單**不會自動清除**（超過 24 小時標示 STALE）——「沒審」是義務，只有補審成功或使用者明確決定才解除。
@@ -135,6 +152,7 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 - 額度查詢用的 `account/rateLimits/read` 是 Codex app-server 的實驗性 API；查不到時狀態為 `unknown`，不擋流程。
 - 官方 plugin 更新可能改變 `codex-companion.mjs` 的介面；本 plugin 只依賴 `review/adversarial-review/task/setup` 四個子指令與 `--json` 輸出。
 - 不做：review gate、cloud task、fast mode、自動等待額度重置（改用未審清單 + 下次 session 接手）。
+- Antigravity 規劃層只在 `agy` 1.1.27 實測過 headless／plan mode 行為；額度用完或未登入時只會看到 `agy-error` 並降級。工作區指紋不含 ignored 檔。
 
 ## 反安裝
 
@@ -148,5 +166,11 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 ## 開發
 
 本 repo 用 `plans/` 放計畫、以自身流程 dogfood（計畫先經 Codex 審查再實作）。維護者本機另裝 wiki plugin 做知識庫，相關檔案走 `.git/info/exclude` 不進版控。
+
+測試（`node:test`，不需安裝任何套件；用假 CLI，不會真的呼叫 Codex／agy）：
+```bash
+node --test "plugins/codex-dispatch/test/*.test.mjs"
+```
+維護者本機把它設成 review 前的機械檢查：`.claude/codex-dispatch.local.json` → `{ "checks": ["node --test plugins/codex-dispatch/test/*.test.mjs"] }`。
 
 **改完怎麼更新到各專案**：安裝本質是「複製到版本化快取」，改原始碼不會自動生效。維護者本機把 marketplace 註冊為目錄（`claude plugin marketplace add <本機路徑>`），改完跑 `node update.js`（bump patch → marketplace update → 對 `projects.local.txt` 列的專案跑 `claude plugin update`）。從 GitHub 安裝的使用者則是 `claude plugin marketplace update codex-dispatch-plugin` + `claude plugin update codex-dispatch@codex-dispatch-plugin --scope local`（需先 push）。
