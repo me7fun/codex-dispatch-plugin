@@ -29,10 +29,10 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/dispatch.mjs" <子指令> --json ...
 
 ## 觸發規則
 1. **估計**改動 > `lineThreshold` 行或 > `fileThreshold` 個檔案，或使用者直接說「先寫計畫」：
-   a. 先 `plan-architect "<需求：目標、限制、涉及範圍>" --json`（agy 唯讀讀「淨化副本」——只含 git 看得到的檔，機密樣式、ignored、node_modules 不複製給它；草案寫到 `<planDir>/<slug>.md`；submodule 佈局加 `--cwd`；要指定檔名用 `--output`）。輸出的 `workspace.excluded` 非空時一句告知使用者哪些檔被排除。`planner=off`（回 `planner-off`）→ 略過 a，直接自己寫計畫。
+   a. 先 `plan-architect "<需求：目標、限制、涉及範圍>" --json`（agy 唯讀讀工作區，草案寫到 `<planDir>/<slug>.md`；submodule 佈局加 `--cwd`；要指定檔名用 `--output`）。`planner=off`（回 `planner-off`）→ 略過 a，直接自己寫計畫。
       - `ok=true` → 讀草案，**用我的判斷審閱修訂**：錯的檔案／API 引用改掉、缺的失敗情境補上、格式對齊「目標、涉及檔案、步驟、測試方式、不做什麼」；在計畫開頭保留「草案由 Antigravity 產出、Claude 修訂了什麼」一句。
       - `ok=false` 且 `reason` 是 `agy-not-installed`／`agy-error`／`invalid-output` → 一句告知使用者，**自己寫計畫**到 `<planDir>/<slug>.md`，不重試、不中斷、不記未審清單（這不是 Codex 失敗）。
-      - `reason=local-error`（路徑、不是 git repo；或 `--no-sandbox-copy` 下的機密檔）→ 依訊息請使用者處理；這輪同樣自己寫計畫繼續，不自行加 `--allow-secrets`、不自行加 `--no-sandbox-copy`。
+      - `reason=local-error`（機密檔、路徑、不是 git repo）→ 依訊息請使用者處理；這輪同樣自己寫計畫繼續，不自行加 `--allow-secrets`。
    b. `plan-review <planDir>/<slug>.md --json`（`reviewer-claude` → 自審 B 變體）。採納合理意見修訂計畫（在計畫尾端記一行審查紀錄），再開始實作。
 2. 實作完成（尚未 commit）：`review --json`（`reviewer-claude` → 自審 A 變體，target 照回傳填；預設 adversarial 模式＋內建嚴重度校準：HIGH 只算單人正常操作會碰到的缺陷，多 session／極端時序最高 MEDIUM，confidence 低於門檻的另列 `lowConfidence` 不自動修，沒有 HIGH 就 approve）。
    - 送審範圍是整個 working tree：若 `git status` 顯示有**不是我這次改的**未提交變更，先告知使用者「這些會一起被審」；要只審某段就用 `--base <ref>`／`--scope branch`。

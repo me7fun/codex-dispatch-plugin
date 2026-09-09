@@ -26,10 +26,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const argv = process.argv.slice(2);
 const cwd = process.cwd();
-const walk = (d, prefix, acc) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) walk(path.join(d, e.name), prefix + e.name + "/", acc); else acc.push(prefix + e.name); } return acc; };
-let files = null;
-try { files = walk(cwd, "", []).sort(); } catch { files = null; }
-if (process.env.FAKE_AGY_OUT) fs.writeFileSync(process.env.FAKE_AGY_OUT, JSON.stringify({ argv, cwd, files }));
+if (process.env.FAKE_AGY_OUT) fs.writeFileSync(process.env.FAKE_AGY_OUT, JSON.stringify({ argv, cwd }));
 if (process.env.FAKE_AGY_WRITE) fs.writeFileSync(path.join(cwd, process.env.FAKE_AGY_WRITE), "pwned");
 if (process.env.FAKE_AGY_APPEND) fs.appendFileSync(path.join(cwd, process.env.FAKE_AGY_APPEND), "\\nmore");
 if (process.env.FAKE_AGY_MKFILE_ABS) { fs.mkdirSync(path.dirname(process.env.FAKE_AGY_MKFILE_ABS), { recursive: true }); fs.writeFileSync(process.env.FAKE_AGY_MKFILE_ABS, "someone else"); }
@@ -37,8 +34,7 @@ const sleep = Number(process.env.FAKE_AGY_SLEEP_MS || 0);
 if (sleep) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, sleep);
 if (process.env.FAKE_AGY_EXIT) { process.stderr.write("fake agy boom\\n"); process.exit(Number(process.env.FAKE_AGY_EXIT)); }
 if (process.env.FAKE_AGY_STDOUT !== undefined) { process.stdout.write(process.env.FAKE_AGY_STDOUT); process.exit(0); }
-let resp = process.env.FAKE_AGY_RESPONSE !== undefined ? process.env.FAKE_AGY_RESPONSE : "# Fake plan\\n\\n## 目標\\nSee [index.js](file:///C:/x/index.js#L1) and [add](file:///C:/x/index.js).\\n";
-if (process.env.FAKE_AGY_ECHO_CWD) resp = "# Echo\\n\\nnative: " + cwd + "\\\\src\\\\a.js\\nfwd: " + cwd.replace(/\\\\/g, "/") + "/src/a.js\\nurl: " + require("node:url").pathToFileURL(path.join(cwd, "src", "a.js")).href + "\\n";
+const resp = process.env.FAKE_AGY_RESPONSE !== undefined ? process.env.FAKE_AGY_RESPONSE : "# Fake plan\\n\\n## 目標\\nSee [index.js](file:///C:/x/index.js#L1) and [add](file:///C:/x/index.js).\\n";
 const payload = { conversation_id: "fake-conv", status: process.env.FAKE_AGY_STATUS || "SUCCESS", response: resp, duration_seconds: 1.5, num_turns: 1, usage: { input_tokens: 1 } };
 if (process.env.FAKE_AGY_ERROR) payload.error = process.env.FAKE_AGY_ERROR;
 if (process.env.FAKE_AGY_DENIED) payload.denied_actions = [{ action: process.env.FAKE_AGY_DENIED, display_name: "X" }];
@@ -99,7 +95,7 @@ function run(p, args, { env = {}, fake = true } = {}) {
   return { status: r.status, stdout: r.stdout, stderr: r.stderr, json, calls };
 }
 
-test("成功：寫出計畫檔、JSON 欄位齊全、argv 安全（plan mode、add-dir＝淨化副本、skip-permissions、-p 最後）、連結壓平", () => {
+test("成功：寫出計畫檔、JSON 欄位齊全、argv 安全（plan mode、add-dir、skip-permissions、-p 最後）、連結壓平", () => {
   const p = makeProject("ok", { files: { "src/a.js": "x" } });
   const r = run(p, ["Add a login page with OAuth"]);
   assert.equal(r.status, 0, r.stdout + r.stderr);
@@ -123,44 +119,13 @@ test("成功：寫出計畫檔、JSON 欄位齊全、argv 安全（plan mode、a
   assert.ok(i("--mode") >= 0 && argv[i("--mode") + 1] === "plan");
   assert.ok(i("--output-format") >= 0 && argv[i("--output-format") + 1] === "json");
   assert.ok(i("--add-dir") >= 0);
-  const addDir = argv[i("--add-dir") + 1];
-  assert.notEqual(path.resolve(addDir), path.resolve(fs.realpathSync.native(p.dir))); // 交給 agy 的不是真目錄
-  assert.match(path.basename(addDir), /^codex-dispatch-agy-/);
-  assert.ok(!fs.existsSync(addDir), "副本用完即刪");
-  assert.equal(path.resolve(r.calls.cwd), path.resolve(addDir));
-  assert.deepEqual(r.calls.files, ["src/a.js"]);
-  assert.equal(r.json.workspace.mode, "sandbox-copy");
-  assert.equal(r.json.workspace.files, 1);
-  assert.deepEqual(r.json.workspace.excluded, []);
+  assert.equal(path.resolve(argv[i("--add-dir") + 1]), path.resolve(fs.realpathSync.native(p.dir)));
   assert.ok(i("--print-timeout") >= 0 && /^\d+s$/.test(argv[i("--print-timeout") + 1]));
   assert.equal(argv[argv.length - 2], "-p");
   assert.match(argv[argv.length - 1], /Add a login page with OAuth/);
   assert.match(argv[argv.length - 1], /READ-ONLY/);
-  assert.match(argv[argv.length - 1], /sanitized copy/);
   assert.ok(argv.includes("--dangerously-skip-permissions")); // print 模式沒人能答工具確認，不帶會被 soft-deny 成空回應
-});
-
-test("--no-sandbox-copy：add-dir 與 cwd 是真目錄，prompt 不提副本", () => {
-  const p = makeProject("direct", { files: { "src/a.js": "x" } });
-  const r = run(p, ["do thing", "--no-sandbox-copy"]);
-  assert.equal(r.status, 0, r.stdout);
-  const argv = r.calls.argv;
-  assert.equal(path.resolve(argv[argv.indexOf("--add-dir") + 1]), path.resolve(fs.realpathSync.native(p.dir)));
   assert.equal(path.resolve(r.calls.cwd), path.resolve(fs.realpathSync.native(p.dir)));
-  assert.ok(!/sanitized copy/.test(argv[argv.length - 1]));
-  assert.equal(r.json.workspace.mode, "direct");
-});
-
-test("淨化副本：agy 回應裡的副本路徑（原生／正斜線／file URL）全部換回真目錄", () => {
-  const p = makeProject("rewrite", { files: { "src/a.js": "x" } });
-  const r = run(p, ["do thing"], { env: { FAKE_AGY_ECHO_CWD: "1" } });
-  assert.equal(r.status, 0, r.stdout);
-  const doc = fs.readFileSync(r.json.output, "utf8");
-  const real = fs.realpathSync.native(p.dir);
-  assert.ok(!/codex-dispatch-agy-/.test(doc), doc);
-  assert.ok(doc.includes(`${real}${path.sep}src${path.sep}a.js`) || doc.toLowerCase().includes(`${real}${path.sep}src${path.sep}a.js`.toLowerCase()), doc);
-  assert.ok(doc.toLowerCase().includes(`${real.replace(/\\/g, "/")}/src/a.js`.toLowerCase()), doc);
-  assert.ok(!/codex-dispatch-agy-/.test(r.json.raw));
 });
 
 test("未安裝 agy → agy-not-installed、exit 1、不建檔", () => {
@@ -219,25 +184,15 @@ test("指紋：agy 建新檔／改本來就 dirty 的 tracked 檔／改既有 un
   const p = makeProject("fp", { files: { "src/a.js": "v1\n", "notes.txt": "n1\n" }, commit: true });
   fs.writeFileSync(path.join(p.dir, "src", "a.js"), "v2\n"); // tracked，已 dirty
   fs.writeFileSync(path.join(p.dir, "scratch.txt"), "u1\n"); // untracked
-  // 淨化副本模式：agy 的 cwd 是副本，相對路徑寫入只弄髒副本（用完即刪），真 repo 不動 → 仍成功
-  const sb = run(p, ["do thing"], { env: { FAKE_AGY_WRITE: "PWNED.txt" } });
-  assert.equal(sb.status, 0, sb.stdout);
-  assert.ok(!fs.existsSync(path.join(p.dir, "PWNED.txt")));
-  fs.rmSync(path.join(p.dir, "plans"), { recursive: true, force: true });
-  // 真目錄模式：任何變動都是 agy-error
-  const r1 = run(p, ["do thing", "--no-sandbox-copy"], { env: { FAKE_AGY_WRITE: "PWNED.txt" } });
+  const r1 = run(p, ["do thing"], { env: { FAKE_AGY_WRITE: "PWNED.txt" } });
   assert.equal(r1.json.reason, "agy-error", r1.stdout);
   assert.match(r1.json.error, /工作區有變動/);
   fs.unlinkSync(path.join(p.dir, "PWNED.txt"));
-  const r2 = run(p, ["do thing", "--no-sandbox-copy"], { env: { FAKE_AGY_APPEND: path.join("src", "a.js") } });
+  const r2 = run(p, ["do thing"], { env: { FAKE_AGY_APPEND: path.join("src", "a.js") } });
   assert.equal(r2.json.reason, "agy-error", r2.stdout);
-  const r3 = run(p, ["do thing", "--no-sandbox-copy"], { env: { FAKE_AGY_APPEND: "scratch.txt" } });
+  const r3 = run(p, ["do thing"], { env: { FAKE_AGY_APPEND: "scratch.txt" } });
   assert.equal(r3.json.reason, "agy-error", r3.stdout);
   assert.ok(!fs.existsSync(path.join(p.dir, "plans")));
-  // 副本模式下用絕對路徑改真 repo 一樣抓得到
-  const r4 = run(p, ["do thing"], { env: { FAKE_AGY_MKFILE_ABS: path.join(p.dir, "PWNED2.txt") } });
-  assert.equal(r4.json.reason, "agy-error", r4.stdout);
-  fs.unlinkSync(path.join(p.dir, "PWNED2.txt"));
   const ok = run(p, ["do thing"]);
   assert.equal(ok.status, 0, ok.stdout);
 });
@@ -277,77 +232,42 @@ test("引數驗證：--model 元字元／--effort 非法／--timeout 0 → local
   assert.equal(ok.calls.argv[i + 1], "high");
 });
 
-test("機密：根 .env → 淨化副本不複製它、照常成功並列在 excluded；--allow-secrets 才複製；--no-sandbox-copy 整個拒絕", () => {
+test("機密：根 .env → local-error 且未呼叫；--allow-secrets 放行", () => {
   const p = makeProject("secret", { files: { ".env": "KEY=1", "src/a.js": "x" } });
   const r = run(p, ["do thing"]);
-  assert.equal(r.status, 0, r.stdout);
-  assert.deepEqual(r.calls.files, ["src/a.js"]); // agy 物理上讀不到 .env
-  assert.deepEqual(r.json.workspace.excluded, [".env"]);
-  fs.rmSync(path.join(p.dir, "plans"), { recursive: true, force: true });
+  assert.equal(r.status, 2);
+  assert.equal(r.json.reason, "local-error");
+  assert.match(r.json.error, /\.env/);
+  assert.match(r.json.error, /Antigravity/);
+  assert.match(r.json.error, /--cwd <子 repo>/);
+  assert.equal(r.calls, null);
   const r2 = run(p, ["do thing", "--allow-secrets"]);
   assert.equal(r2.status, 0, r2.stdout);
-  assert.deepEqual(r2.calls.files, [".env", "src/a.js"]);
-  assert.deepEqual(r2.json.workspace.excluded, []);
-  const r3 = run(p, ["do thing", "--no-sandbox-copy", "--force"]);
-  assert.equal(r3.status, 2);
-  assert.equal(r3.json.reason, "local-error");
-  assert.match(r3.json.error, /\.env/);
-  assert.match(r3.json.error, /Antigravity/);
-  assert.match(r3.json.error, /淨化副本/);
-  assert.match(r3.json.error, /--cwd <子 repo>/);
-  assert.equal(r3.calls, null);
+  assert.ok(r2.calls);
 });
 
-test("機密：gitignored .env 與忽略目錄內的 .pem 根本不複製（不在 excluded，因為 ignored 一律不進副本）；--no-sandbox-copy 才擋；.env.example 放行", () => {
+test("機密：gitignored .env 與忽略目錄內的 .pem 也擋（agy 不看 .gitignore）；.env.example 放行", () => {
   const p = makeProject("ignored", { files: { ".gitignore": ".env\nvendor/\n", ".env": "KEY=1", "vendor/creds.pem": "x", "src/a.js": "x" } });
   const r = run(p, ["do thing"]);
-  assert.equal(r.status, 0, r.stdout);
-  assert.deepEqual(r.calls.files, [".gitignore", "src/a.js"]);
-  assert.deepEqual(r.json.workspace.excluded, []);
-  const d = run(p, ["do thing", "--no-sandbox-copy", "--force"]);
-  assert.equal(d.status, 2, d.stdout);
-  assert.match(d.json.error, /\.env/);
-  assert.match(d.json.error, /vendor\/creds\.pem/);
-  assert.equal(d.calls, null);
+  assert.equal(r.status, 2, r.stdout);
+  assert.match(r.json.error, /\.env/);
+  assert.match(r.json.error, /vendor\/creds\.pem/);
+  assert.equal(r.calls, null);
   const p2 = makeProject("template", { files: { ".gitignore": "node_modules/\n", "node_modules/foo/.env.example": "KEY=", "src/a.js": "x" } });
-  const r2 = run(p2, ["do thing", "--no-sandbox-copy"]);
+  const r2 = run(p2, ["do thing"]);
   assert.equal(r2.status, 0, r2.stdout);
 });
 
-test("機密在巢狀 repo（git ls-files 不會進去）→ 副本排除它、其他檔照複製；--no-sandbox-copy 仍被擋", () => {
+test("機密在巢狀 repo（git ls-files 不會進去）→ 仍被擋", () => {
   const p = makeProject("nested", { files: { "src/a.js": "x" } });
   const nested = path.join(p.dir, "games", "slot");
   fs.mkdirSync(nested, { recursive: true });
   assert.equal(git(nested, "init", "-q").status, 0);
   fs.writeFileSync(path.join(nested, "credentials.json"), "{}");
-  fs.writeFileSync(path.join(nested, "game.js"), "g");
   const r = run(p, ["do thing"]);
-  assert.equal(r.status, 0, r.stdout);
-  assert.deepEqual(r.calls.files, ["games/slot/game.js", "src/a.js"]);
-  assert.deepEqual(r.json.workspace.excluded, ["games/slot/credentials.json"]);
-  const d = run(p, ["do thing", "--no-sandbox-copy", "--force"]);
-  assert.equal(d.status, 2, d.stdout);
-  assert.match(d.json.error, /games\/slot\/credentials\.json/);
-  assert.equal(d.calls, null);
-});
-
-test("淨化副本：未 ignore 的 node_modules 與 symlink 不複製；副本裡沒有 .git", (t) => {
-  const p = makeProject("nm", { files: { "node_modules/x/index.js": "m", "src/a.js": "x" }, commit: true });
-  const outside = tmpDir("cd-pa-out-");
-  fs.writeFileSync(path.join(outside, "secret.txt"), "s");
-  let linked = false;
-  try {
-    fs.symlinkSync(path.join(outside, "secret.txt"), path.join(p.dir, "link.txt"), "file");
-    linked = true;
-  } catch {
-    linked = false;
-  }
-  const r = run(p, ["do thing"]);
-  assert.equal(r.status, 0, r.stdout);
-  assert.deepEqual(r.calls.files, ["src/a.js"]);
-  assert.ok(r.json.workspace.skipped.nodeModules >= 1);
-  if (linked) assert.equal(r.json.workspace.skipped.symlink, 1);
-  else t.diagnostic("symlink 建不出來（Windows 需權限），略過 symlink 斷言");
+  assert.equal(r.status, 2, r.stdout);
+  assert.match(r.json.error, /games\/slot\/credentials\.json/);
+  assert.equal(r.calls, null);
 });
 
 test("--output：逃逸、非 .md、已存在 → local-error；--force 覆寫；新目錄自動建立", () => {
