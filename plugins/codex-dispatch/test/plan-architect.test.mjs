@@ -95,7 +95,7 @@ function run(p, args, { env = {}, fake = true } = {}) {
   return { status: r.status, stdout: r.stdout, stderr: r.stderr, json, calls };
 }
 
-test("成功：寫出計畫檔、JSON 欄位齊全、argv 安全（plan mode、add-dir、-p 最後、無 skip-permissions）、連結壓平", () => {
+test("成功：寫出計畫檔、JSON 欄位齊全、argv 安全（plan mode、add-dir、skip-permissions、-p 最後）、連結壓平", () => {
   const p = makeProject("ok", { files: { "src/a.js": "x" } });
   const r = run(p, ["Add a login page with OAuth"]);
   assert.equal(r.status, 0, r.stdout + r.stderr);
@@ -124,7 +124,7 @@ test("成功：寫出計畫檔、JSON 欄位齊全、argv 安全（plan mode、a
   assert.equal(argv[argv.length - 2], "-p");
   assert.match(argv[argv.length - 1], /Add a login page with OAuth/);
   assert.match(argv[argv.length - 1], /READ-ONLY/);
-  assert.ok(!argv.includes("--dangerously-skip-permissions"));
+  assert.ok(argv.includes("--dangerously-skip-permissions")); // print 模式沒人能答工具確認，不帶會被 soft-deny 成空回應
   assert.equal(path.resolve(r.calls.cwd), path.resolve(fs.realpathSync.native(p.dir)));
 });
 
@@ -170,7 +170,9 @@ test("invalid-output：stdout 非 JSON／讀檔被拒／回應空白／回應沒
   assert.equal(run(p, ["do thing"], { env: { FAKE_AGY_STDOUT: "not json at all" } }).json.reason, "invalid-output");
   const d = run(p, ["do thing"], { env: { FAKE_AGY_DENIED: "read_file", FAKE_AGY_RESPONSE: "" } });
   assert.equal(d.json.reason, "invalid-output");
-  assert.match(d.json.error, /讀檔被拒/);
+  assert.match(d.json.error, /soft-deny/);
+  assert.match(d.json.error, /--dangerously-skip-permissions/);
+  assert.ok(!/add-dir|沒被加入/.test(d.json.error));
   assert.equal(run(p, ["do thing"], { env: { FAKE_AGY_RESPONSE: "   " } }).json.reason, "invalid-output");
   const n = run(p, ["do thing"], { env: { FAKE_AGY_RESPONSE: "I generated the implementation plan at file:///x/plan.md for your review." } });
   assert.equal(n.json.reason, "invalid-output");
@@ -237,6 +239,7 @@ test("機密：根 .env → local-error 且未呼叫；--allow-secrets 放行", 
   assert.equal(r.json.reason, "local-error");
   assert.match(r.json.error, /\.env/);
   assert.match(r.json.error, /Antigravity/);
+  assert.match(r.json.error, /--cwd <子 repo>/);
   assert.equal(r.calls, null);
   const r2 = run(p, ["do thing", "--allow-secrets"]);
   assert.equal(r2.status, 0, r2.stdout);

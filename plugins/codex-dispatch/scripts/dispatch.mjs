@@ -970,7 +970,10 @@ function buildArchitectPrompt(request) {
 }
 
 function runAgy(found, { root, prompt, model, effort, timeoutSec }) {
-  const args = [...found.args, "--add-dir", root, "--mode", "plan", "--output-format", "json", "--print-timeout", `${timeoutSec}s`];
+  // --dangerously-skip-permissions：print 模式沒有人能回答工具確認，預設 toolPermission=request-review 會把
+  // ListDir 之類需要確認的唯讀工具「soft-deny」並以空回應結束整段對話（實測 2026-09-08 讀 47 步後在 step 48 被砍）。
+  // plan mode 本身擋寫、下方另有工作區指紋守衛，所以自動核准只影響唯讀工具。
+  const args = [...found.args, "--add-dir", root, "--mode", "plan", "--dangerously-skip-permissions", "--output-format", "json", "--print-timeout", `${timeoutSec}s`];
   if (model) args.push("--model", model);
   if (effort) args.push("--effort", effort);
   args.push("-p", prompt); // -p 永遠最後：agy 的 -p 把下一個 token 當 prompt，放前面會吃掉其他旗標
@@ -1001,8 +1004,11 @@ function interpretAgy(r) {
   }
   const denied = Array.isArray(payload.denied_actions) ? payload.denied_actions.map((d) => d && d.action).filter(Boolean) : [];
   const response = typeof payload.response === "string" ? payload.response.trim() : "";
-  if (denied.includes("read_file")) return { ok: false, reason: "invalid-output", error: `agy 讀檔被拒（denied_actions: ${denied.join(", ")}）；工作區沒被加入？`, raw: r.stdout };
-  if (!response) return { ok: false, reason: "invalid-output", error: `agy 回應空白${denied.length ? `（denied_actions: ${denied.join(", ")}）` : ""}${errTail ? `；stderr：${errTail}` : ""}`, raw: r.stdout };
+  // denied_actions 非空＝print 模式的工具確認被 soft-deny（agy 會直接結束對話、response 空）。runAgy 已帶
+  // --dangerously-skip-permissions，仍出現多半是 agy 版本不認這個旗標；不是 --add-dir 的問題。
+  const deniedHint = denied.length ? `agy 在 print 模式把需要確認的工具 soft-deny（denied_actions: ${denied.join(", ")}），對話提前結束；dispatch 已帶 --dangerously-skip-permissions，請確認 agy 版本支援此旗標（agy --help）` : "";
+  if (denied.length && !response) return { ok: false, reason: "invalid-output", error: `${deniedHint}${errTail ? `；stderr：${errTail}` : ""}`, raw: r.stdout };
+  if (!response) return { ok: false, reason: "invalid-output", error: `agy 回應空白${errTail ? `；stderr：${errTail}` : ""}`, raw: r.stdout };
   if (!/^#{1,6}\s+\S/m.test(response)) return { ok: false, reason: "invalid-output", error: "agy 回應沒有任何 Markdown 標題，不像計畫（plan mode 有時只回「已產生計畫」連結）", raw: r.stdout };
   return { ok: true, response, conversationId: typeof payload.conversation_id === "string" ? payload.conversation_id : null, durationSeconds: typeof payload.duration_seconds === "number" ? payload.duration_seconds : null, usage: payload.usage ?? null, deniedActions: denied };
 }
@@ -1064,7 +1070,7 @@ async function cmdPlanArchitect(argv) {
   if (listed.error) return fail(`無法列舉工作區檔案（機密閘門 fail-closed）：${listed.error}`);
   const scan = [...listed.visible, ...listed.ignored.filter((p) => !SECRET_TEMPLATE_RE.test(p))];
   const gate = secretGate(scan, options["allow-secrets"], "交給 Antigravity（agy 會讀整個工作區，含 .gitignore 忽略的檔，內容會送到 Google）");
-  if (gate) return fail(gate);
+  if (gate) return fail(`${gate}。monorepo／submodule 佈局請改 --cwd <子 repo> 把審查根縮到要規劃的專案`);
 
   const common = { reviewRoot: roots.reviewRoot, configRoot: roots.configRoot, prompt, output: null, outputRel: null, fallback: null, agy: null };
   const found = findAgy();
