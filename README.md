@@ -94,11 +94,13 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
   "selfReview": "auto",
   "confidenceThreshold": 0.75,
   "reviewer": "codex",
-  "planner": "auto"
+  "planner": "auto",
+  "plannerAllowSecrets": false
 }
 ```
 - `reviewer`：`codex`（預設）｜`claude`——**只停用 Codex 審查與救援**：審 diff／審計畫／救援全改由 Claude 唯讀 subagent 自審（同一套 prompt 與 findings 規則，自審上限 2 輪）。這是你的決定，不是降級：不查額度、不佔輪次、不記未審清單、不加「未經 Codex 審查」標題、Stop hook 放行、`preflight` 把 Codex 相關檢查標為略過。沒裝 Codex 的人設這個就能用整套流程。
 - `planner`：`auto`（預設，有 `agy` 就先出草案）｜`off`（不用 Antigravity）。要**完全不碰外部 AI**要兩個都關：`{ "reviewer": "claude", "planner": "off" }`。
+- `plannerAllowSecrets`：`false`（預設）｜`true`＝**強制讀取**。agy 讀的是整個工作區、連 `.gitignore` 忽略的檔都讀，又沒有任何排除清單，所以預設只要工作區裡有一個疑似機密檔（`.npmrc`、`*.key`、`.env`…，含子 repo 與 node_modules）就整個拒絕。設 `true` 就不再拒絕，等於每次都帶 `--allow-secrets`；代價是那些檔的內容可能被 agy 讀走送到 Google。monorepo 根下有很多子 repo 的人通常需要開這個。只影響 `plan-architect`，Codex 審查的機密閘門不受影響。
 - `confidenceThreshold`：Codex 給每條 finding 的信心低於此值 → 移到 `lowConfidence`，只呈現、不自動修、不影響 verdict。
 - `onCodexUnavailable`：`auto`（審 diff→繼續、審計畫/救援→詢問）｜`ask`（全部詢問）｜`continue`（全部繼續）
 - `selfReview`：Codex 不可用時的降級——`auto`（審 diff 失敗自動由 Claude 唯讀 subagent 自審）｜`ask`（每次先問）｜`off`。自審過的條目仍留在未審清單（標「[自審]」），額度恢復後仍建議補審。prompt 有三個變體（審 diff／審計畫／rescue 重新診斷）在 `prompts/self-review.md`。手動的 `/codex-dispatch:review` 不會自審，它只回報 Codex 結果。
@@ -124,10 +126,11 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 | | |
 |---|---|
 | 觸發 | 改動估計 >50 行或 >3 檔時，Claude 先跑 `dispatch.mjs plan-architect "<需求>"`，草案寫到 `<規則根>/plans/<slug>.md`，Claude 審閱修訂後再送 `plan-review` |
-| 怎麼跑 | `agy --add-dir <審查根> --mode plan --output-format json --print-timeout <sec>s -p "<prompt>"`，無 shell、`-p` 固定放最後（agy 的 `-p` 會把下一個 token 當 prompt） |
+| 怎麼跑 | `agy --add-dir <審查根> --mode plan --dangerously-skip-permissions --output-format json --print-timeout <sec>s -p "<prompt>"`，無 shell、`-p` 固定放最後（agy 的 `-p` 會把下一個 token 當 prompt） |
 | 唯讀怎麼保證 | ① `--mode plan`：實測 headless 下不寫 repo（只在 `~/.gemini/antigravity-cli/brain/` 留副本），連 `--dangerously-skip-permissions` 都擋得住；**預設模式加 `--add-dir` 會真的寫檔，所以永遠不用**；② shell 指令 headless 一律自動拒絕；③ 執行前後比對工作區指紋（porcelain 條目＋dirty/untracked 檔內容 sha1），有變動就不採用輸出 |
 | 降級條件 | `agy` 不在 PATH 也不在 `%LOCALAPPDATA%\agy\bin`（`reason=agy-not-installed`）、執行失敗／逾時／`status≠SUCCESS`／工作區被改（`agy-error`）、回應空白／讀檔被拒／沒有標題（`invalid-output`）→ `ok:false`，Claude 一句告知後**自己寫計畫**，不重試、不中斷、不記未審清單 |
-| 機密 | **agy 不尊重 `.gitignore`**（實測讀得出 gitignored `.env` 與忽略目錄內的檔）。執行前列舉整個工作區：tracked ＋ untracked ＋ **ignored**，遞迴 submodule 與巢狀 repo；命中機密樣式就拒絕（`local-error`）。ignored 清單放過 `.env.example/.sample/.template/.dist` 範本檔 |
+| 機密 | **agy 不尊重 `.gitignore`**（實測讀得出 gitignored `.env` 與忽略目錄內的檔），也沒有任何排除清單。執行前列舉整個工作區：tracked ＋ untracked ＋ **ignored**，遞迴 submodule 與巢狀 repo；命中機密樣式就拒絕（`local-error`）。ignored 清單放過 `.env.example/.sample/.template/.dist` 範本檔。不想被擋：設定 `plannerAllowSecrets: true`（強制讀取，機密內容可能送到 Google）或改 `--cwd <子 repo>` |
+| 為什麼帶 `--dangerously-skip-permissions` | print 模式沒人能回答工具確認；agy 預設 `toolPermission=request-review`，模型叫到 ListDir 之類需確認的**唯讀**工具就被 soft-deny、對話立刻結束、回 `status:SUCCESS` 但 `response:""`（實測讀 47 步後在第 48 步被砍；小 prompt 碰不到所以 smoke test 會過）。plan mode 禁寫、又有指紋守衛，此旗標只影響唯讀工具的確認 |
 | 不做 | 不查 Antigravity 額度、不自動接著跑 plan-review（每步可見）、不加設定鍵（要關掉就別裝 agy）、不代改 `~/.gemini/antigravity-cli/settings.json` |
 
 非標準安裝可設環境變數 `CODEX_DISPATCH_AGY=<agy 絕對路徑>`。
@@ -146,7 +149,7 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 
 - Codex review 會把 **diff 內容**（含未 commit、未追蹤的檔案）送到 OpenAI；plan-review 送計畫全文。
 - `plan-architect` 讓 Antigravity CLI 讀**整個工作區**（它自己決定讀哪些檔，且不看 `.gitignore`），內容送到 Google；執行前先過同一套機密閘門（含 ignored、submodule、巢狀 repo）。
-- CLI 送審前會擋下疑似機密檔（`.env*`、`*.pem/*.key`、`credentials.json`、`auth.json`、`.npmrc`…），回 `local-error`；確認無機密才加 `--allow-secrets`。
+- CLI 送審前會擋下疑似機密檔（`.env*`、`*.pem/*.key`、`credentials.json`、`auth.json`、`.npmrc`…），回 `local-error`；確認無機密才加 `--allow-secrets`。`plan-architect` 可用設定 `plannerAllowSecrets: true` 永久放行（強制讀取）。
 - `plan-review` / `--prompt-file` 只接受專案根目錄內的一般檔案（realpath 比對，擋 symlink 逃逸）。
 - 未審清單**不會自動清除**（超過 24 小時標示 STALE）——「沒審」是義務，只有補審成功或使用者明確決定才解除。
 - 審查輪次計數（同一批未 commit 改動最多 `maxRounds` 輪）：approve 或 commit 開新一輪；7 天沒動自動清除。多個 Claude 視窗同時審同一專案是安全的（跨程序鎖 + 原子佔用）。

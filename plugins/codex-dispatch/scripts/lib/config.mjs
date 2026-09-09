@@ -26,7 +26,8 @@ export const DEFAULTS = Object.freeze({
   selfReview: "auto", // auto | ask | off：Codex 不可用時由 Claude subagent 自審
   confidenceThreshold: 0.75, // 低於此信心的 finding 不進 findings（另列 lowConfidence，不自動修）
   reviewer: "codex", // codex | claude：claude = 使用者選擇不用 Codex，審 diff／審計畫／救援全走 Claude 唯讀 subagent（不提醒、不記未審）
-  planner: "auto" // auto | off：off = 不用 Antigravity CLI 出規劃草案
+  planner: "auto", // auto | off：off = 不用 Antigravity CLI 出規劃草案
+  plannerAllowSecrets: false // true = plan-architect 不再因疑似機密檔拒絕（agy 讀整個工作區，機密檔內容會送到 Google；等同每次都帶 --allow-secrets）
 });
 
 const ENUMS = {
@@ -75,7 +76,8 @@ export function loadConfig(root) {
         ? raw.confidenceThreshold
         : DEFAULTS.confidenceThreshold,
     reviewer: ENUMS.reviewer.includes(raw.reviewer) ? raw.reviewer : DEFAULTS.reviewer,
-    planner: ENUMS.planner.includes(raw.planner) ? raw.planner : DEFAULTS.planner
+    planner: ENUMS.planner.includes(raw.planner) ? raw.planner : DEFAULTS.planner,
+    plannerAllowSecrets: raw.plannerAllowSecrets === true
   };
   const local = loadLocalChecks(configRoot);
   config.checks = local.checks;

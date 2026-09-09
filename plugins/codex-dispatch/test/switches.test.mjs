@@ -185,6 +185,35 @@ test("quota：reviewer=claude 回 ok 且 disabled，不連 Codex", () => {
   assert.match(t.stdout, /已停用（reviewer=claude）/);
 });
 
+test("plannerAllowSecrets=true：工作區有 .env 也不拒絕、假 agy 被呼叫；預設 false 拒絕且訊息提到設定鍵；非布林 true 視為 false", () => {
+  const mk = (name, config) => {
+    const p = makeProject(name, { config, files: { ".env": "KEY=1", "src/a.js": "x" } });
+    const fake = path.join(p.side, "fake-agy.js");
+    const marker = path.join(p.side, "marker.json");
+    fs.writeFileSync(fake, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "called"); process.stdout.write(JSON.stringify({status:"SUCCESS",response:"# x"}));`);
+    // envFor 固定拿掉 CODEX_DISPATCH_AGY（其他案例不該找到 agy），這裡要真的呼叫假 agy 所以自己 spawn
+    const r = spawnSync(process.execPath, [DISPATCH, "plan-architect", "do thing", "--json"], { cwd: p.dir, encoding: "utf8", windowsHide: true, env: { ...envFor(p), CODEX_DISPATCH_AGY: fake } });
+    let json = null;
+    try {
+      json = JSON.parse(r.stdout);
+    } catch {
+      json = null;
+    }
+    return { status: r.status, stdout: r.stdout, json, called: fs.existsSync(marker) };
+  };
+  const ra = mk("allow", { plannerAllowSecrets: true });
+  assert.equal(ra.status, 0, ra.stdout);
+  assert.equal(ra.called, true);
+  const rd = mk("deny", {});
+  assert.equal(rd.status, 2, rd.stdout);
+  assert.equal(rd.json.reason, "local-error");
+  assert.match(rd.json.error, /plannerAllowSecrets/);
+  assert.equal(rd.called, false);
+  const rs = mk("string", { plannerAllowSecrets: "true" });
+  assert.equal(rs.status, 2, rs.stdout);
+  assert.equal(rs.called, false);
+});
+
 test("非法值退回預設（reviewer=codex、planner=auto）", () => {
   const p = makeProject("invalid", { config: { reviewer: "unknown", planner: "bad" } });
   const r = dispatch(p, ["preflight"]);

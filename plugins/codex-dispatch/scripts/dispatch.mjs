@@ -18,6 +18,8 @@
  *                                 救援：預設唯讀（診斷＋建議 patch）；--write 才讓 Codex 改碼
  *   plan-architect <prompt> [--output <file>] [--model m] [--effort low|medium|high] [--timeout sec] [--force] [--allow-secrets]
  *                                 Antigravity CLI（agy）規劃層（選配）：`--mode plan` 唯讀讀取審查根、把規劃草案寫到 <規則根>/<planDir>/<slug>.md。
+ *                                 agy 讀整個工作區（含 .gitignore 忽略的檔），所以工作區有疑似機密檔就拒絕；設定 plannerAllowSecrets=true
+ *                                 （或 --allow-secrets）＝強制讀取：不再拒絕，機密檔內容可能送到 Google。
  *                                 不碰 Codex（不查額度、不佔輪次、不記未審清單）。agy 不在 PATH → agy-not-installed；執行失敗／逾時／status≠SUCCESS／
  *                                 工作區被改 → agy-error；回應空／讀檔被拒／沒有標題 → invalid-output（以上 exit 1，呼叫端降級為 Claude 自己寫計畫）。
  *                                 機密閘門掃整個工作區（含 .gitignore 忽略的檔、submodule、巢狀 repo——agy 都讀得到）。
@@ -1069,8 +1071,9 @@ async function cmdPlanArchitect(argv) {
   const listed = gitWorkspaceFiles(root);
   if (listed.error) return fail(`無法列舉工作區檔案（機密閘門 fail-closed）：${listed.error}`);
   const scan = [...listed.visible, ...listed.ignored.filter((p) => !SECRET_TEMPLATE_RE.test(p))];
-  const gate = secretGate(scan, options["allow-secrets"], "交給 Antigravity（agy 會讀整個工作區，含 .gitignore 忽略的檔，內容會送到 Google）");
-  if (gate) return fail(`${gate}。monorepo／submodule 佈局請改 --cwd <子 repo> 把審查根縮到要規劃的專案`);
+  const allowSecrets = Boolean(options["allow-secrets"]) || cfg.plannerAllowSecrets === true; // 強制讀取：設定檔開關或旗標
+  const gate = secretGate(scan, allowSecrets, "交給 Antigravity（agy 會讀整個工作區，含 .gitignore 忽略的檔，內容會送到 Google）");
+  if (gate) return fail(`${gate}。要讓 agy 連機密檔一起讀（內容送到 Google）就在 ${CONFIG_REL} 設 "plannerAllowSecrets": true；或 monorepo／submodule 佈局改 --cwd <子 repo> 縮小審查根`);
 
   const common = { reviewRoot: roots.reviewRoot, configRoot: roots.configRoot, prompt, output: null, outputRel: null, fallback: null, agy: null };
   const found = findAgy();
