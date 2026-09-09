@@ -124,11 +124,14 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 | | |
 |---|---|
 | 觸發 | 改動估計 >50 行或 >3 檔時，Claude 先跑 `dispatch.mjs plan-architect "<需求>"`，草案寫到 `<規則根>/plans/<slug>.md`，Claude 審閱修訂後再送 `plan-review` |
-| 怎麼跑 | `agy --add-dir <審查根> --mode plan --output-format json --print-timeout <sec>s -p "<prompt>"`，無 shell、`-p` 固定放最後（agy 的 `-p` 會把下一個 token 當 prompt） |
-| 唯讀怎麼保證 | ① `--mode plan`：實測 headless 下不寫 repo（只在 `~/.gemini/antigravity-cli/brain/` 留副本），連 `--dangerously-skip-permissions` 都擋得住；**預設模式加 `--add-dir` 會真的寫檔，所以永遠不用**；② shell 指令 headless 一律自動拒絕；③ 執行前後比對工作區指紋（porcelain 條目＋dirty/untracked 檔內容 sha1），有變動就不採用輸出 |
-| 降級條件 | `agy` 不在 PATH 也不在 `%LOCALAPPDATA%\agy\bin`（`reason=agy-not-installed`）、執行失敗／逾時／`status≠SUCCESS`／工作區被改（`agy-error`）、回應空白／讀檔被拒／沒有標題（`invalid-output`）→ `ok:false`，Claude 一句告知後**自己寫計畫**，不重試、不中斷、不記未審清單 |
-| 機密 | **agy 不尊重 `.gitignore`**（實測讀得出 gitignored `.env` 與忽略目錄內的檔）。執行前列舉整個工作區：tracked ＋ untracked ＋ **ignored**，遞迴 submodule 與巢狀 repo；命中機密樣式就拒絕（`local-error`）。ignored 清單放過 `.env.example/.sample/.template/.dist` 範本檔 |
-| 不做 | 不查 Antigravity 額度、不自動接著跑 plan-review（每步可見）、不加設定鍵（要關掉就別裝 agy）、不代改 `~/.gemini/antigravity-cli/settings.json` |
+| 怎麼跑 | `agy --add-dir <淨化副本> --mode plan --dangerously-skip-permissions --output-format json --print-timeout <sec>s -p "<prompt>"`，無 shell、`-p` 固定放最後（agy 的 `-p` 會把下一個 token 當 prompt） |
+| **交給它的不是真目錄** | agy 沒有任何「AI 排除清單」：`agy --help` 沒有 ignore／exclude 旗標，`read_file` 對 `--add-dir` 內任何路徑都讀，**連 `.gitignore` 忽略的檔都讀**（實測讀得出 gitignored `.env`）。所以唯一可靠的排除法是根本不把檔案放進去：執行前把 git 看得到的檔（tracked＋untracked，**不含 ignored**）複製到 `%TEMP%\codex-dispatch-agy-*`，複製時跳過疑似機密檔（`.env*`、`*.pem/*.key`、`.npmrc`、`credentials.json`…）、`node_modules`、symlink、>8MB 的檔；agy 只拿到這份副本，用完即刪。副本裡沒有的東西它物理上讀不到，不需要「拒絕整個工作區」；被排除的機密檔會列在輸出的 `workspace.excluded` 提醒你。agy 回應裡提到的副本路徑會換回真實路徑 |
+| 為什麼不用縮小 `--cwd` 就好 | 縮小範圍只是碰運氣：子 repo 裡只要還有一個 `.npmrc` 或 node_modules 裡的測試 `server.key`，閘門照樣整個擋掉；而 monorepo 跨子 repo 的規劃題根本縮不了 |
+| 唯讀怎麼保證 | ① `--mode plan`：實測 headless 下不寫 repo（只在 `~/.gemini/antigravity-cli/brain/` 留副本），連 `--dangerously-skip-permissions` 都擋得住；**預設模式加 `--add-dir` 會真的寫檔，所以永遠不用**；② shell 指令 headless 一律自動拒絕；③ 它的工作目錄是副本，相對路徑寫入只弄髒副本；④ 執行前後比對真實工作區指紋（porcelain 條目＋dirty/untracked 檔內容 sha1），有變動就不採用輸出 |
+| 為什麼帶 `--dangerously-skip-permissions` | print 模式沒人能回答工具確認；agy 預設 `toolPermission=request-review`，模型叫到 ListDir 之類需確認的**唯讀**工具就被 soft-deny、對話立刻結束、回 `status:SUCCESS` 但 `response:""`（實測讀 47 步後在第 48 步被砍；小 prompt 碰不到所以 smoke test 會過）。plan mode 禁寫、又有副本與指紋守衛，此旗標只影響唯讀工具的確認 |
+| 降級條件 | `agy` 不在 PATH 也不在 `%LOCALAPPDATA%\agy\bin`（`reason=agy-not-installed`）、執行失敗／逾時／`status≠SUCCESS`／工作區被改（`agy-error`）、回應空白／工具被 soft-deny／沒有標題（`invalid-output`）→ `ok:false`，Claude 一句告知後**自己寫計畫**，不重試、不中斷、不記未審清單 |
+| `--no-sandbox-copy` | 直接把真目錄交給 agy（例如要它看 ignored 的產物）。這時 agy 讀得到任何檔，所以回到 fail-closed：列舉 tracked＋untracked＋**ignored**（遞迴 submodule 與巢狀 repo），任一命中機密樣式就整個拒絕（`local-error`）；ignored 清單放過 `.env.example/.sample/.template/.dist` 範本檔；確認無機密才加 `--allow-secrets` |
+| 不做 | 不查 Antigravity 額度、不自動接著跑 plan-review（每步可見）、不代改 `~/.gemini/antigravity-cli/settings.json`；agy 內建 grep 在 Windows 磁碟機路徑上會解析錯（它自己的 bug），只會讓它多讀幾步，不影響結果 |
 
 非標準安裝可設環境變數 `CODEX_DISPATCH_AGY=<agy 絕對路徑>`。
 
@@ -139,13 +142,13 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 ## 底層 CLI
 
 所有 Codex 呼叫走 `plugins/codex-dispatch/scripts/dispatch.mjs`（`--json` 回統一結果物件；exit 0 成功、1 Codex 端失敗、2 本地錯誤）：
-`resolve` / `quota` / `preflight` / `plan-architect <prompt> [--output f]` / `review` / `plan-review <file>` / `rescue [--write] <prompt>` / `state` / `snippet` / `unwire`。
+`resolve` / `quota` / `preflight` / `plan-architect <prompt> [--output f] [--no-sandbox-copy]` / `review` / `plan-review <file>` / `rescue [--write] <prompt>` / `state` / `snippet` / `unwire`。
 它會從 `~/.claude/plugins/installed_plugins.json` 找官方 plugin 的 `codex-companion.mjs` 直接執行——因為官方 review 類 slash command 設了 `disable-model-invocation`，Claude 自己呼叫不到。
 
 ## 資料與安全
 
 - Codex review 會把 **diff 內容**（含未 commit、未追蹤的檔案）送到 OpenAI；plan-review 送計畫全文。
-- `plan-architect` 讓 Antigravity CLI 讀**整個工作區**（它自己決定讀哪些檔，且不看 `.gitignore`），內容送到 Google；執行前先過同一套機密閘門（含 ignored、submodule、巢狀 repo）。
+- `plan-architect` 讓 Antigravity CLI 自己決定讀哪些檔，內容送到 Google。它沒有排除清單、也不看 `.gitignore`，所以**交給它的是淨化副本**：只含 git 看得到的檔，機密樣式、ignored 檔、node_modules 根本不複製進去（見上方「Antigravity 規劃層」）。`--no-sandbox-copy` 才會給真目錄，此時同一套機密閘門整個拒絕。
 - CLI 送審前會擋下疑似機密檔（`.env*`、`*.pem/*.key`、`credentials.json`、`auth.json`、`.npmrc`…），回 `local-error`；確認無機密才加 `--allow-secrets`。
 - `plan-review` / `--prompt-file` 只接受專案根目錄內的一般檔案（realpath 比對，擋 symlink 逃逸）。
 - 未審清單**不會自動清除**（超過 24 小時標示 STALE）——「沒審」是義務，只有補審成功或使用者明確決定才解除。
@@ -156,7 +159,7 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 - 額度查詢用的 `account/rateLimits/read` 是 Codex app-server 的實驗性 API；查不到時狀態為 `unknown`，不擋流程。
 - 官方 plugin 更新可能改變 `codex-companion.mjs` 的介面；本 plugin 只依賴 `review/adversarial-review/task/setup` 四個子指令與 `--json` 輸出。
 - 不做：review gate、cloud task、fast mode、自動等待額度重置（改用未審清單 + 下次 session 接手）。
-- Antigravity 規劃層只在 `agy` 1.1.27 實測過 headless／plan mode 行為；額度用完或未登入時只會看到 `agy-error` 並降級。工作區指紋不含 ignored 檔。
+- Antigravity 規劃層只在 `agy` 1.1.27 實測過 headless／plan mode 行為；額度用完或未登入時只會看到 `agy-error` 並降級。工作區指紋不含 ignored 檔。淨化副本不含 ignored 檔與 node_modules，所以 agy 看不到建置產物與依賴原始碼；要它看就 `--no-sandbox-copy`（會回到整個工作區的機密閘門）。
 
 ## 反安裝
 

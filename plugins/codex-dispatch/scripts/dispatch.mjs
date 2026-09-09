@@ -16,8 +16,10 @@
  *                                 請 Codex 唯讀審計畫檔，要求回 JSON
  *   rescue [--write] [--model m] [--effort e] [--prompt-file f] [--allow-secrets] [prompt...]
  *                                 救援：預設唯讀（診斷＋建議 patch）；--write 才讓 Codex 改碼
- *   plan-architect <prompt> [--output <file>] [--model m] [--effort low|medium|high] [--timeout sec] [--force] [--allow-secrets]
- *                                 Antigravity CLI（agy）規劃層（選配）：`--mode plan` 唯讀讀取審查根、把規劃草案寫到 <規則根>/<planDir>/<slug>.md。
+ *   plan-architect <prompt> [--output <file>] [--model m] [--effort low|medium|high] [--timeout sec] [--force] [--allow-secrets] [--no-sandbox-copy]
+ *                                 Antigravity CLI（agy）規劃層（選配）：`--mode plan` 唯讀、把規劃草案寫到 <規則根>/<planDir>/<slug>.md。
+ *                                 預設交給 agy 的不是真目錄，而是「淨化副本」：只複製 git 看得到的檔（tracked＋untracked，不含 ignored），
+ *                                 跳過疑似機密檔與 node_modules；agy 讀不到副本裡沒有的東西。--no-sandbox-copy 才直接給真目錄（機密閘門會整個拒絕）。
  *                                 不碰 Codex（不查額度、不佔輪次、不記未審清單）。agy 不在 PATH → agy-not-installed；執行失敗／逾時／status≠SUCCESS／
  *                                 工作區被改 → agy-error；回應空／讀檔被拒／沒有標題 → invalid-output（以上 exit 1，呼叫端降級為 Claude 自己寫計畫）。
  *                                 機密閘門掃整個工作區（含 .gitignore 忽略的檔、submodule、巢狀 repo——agy 都讀得到）。
@@ -807,6 +809,103 @@ const AGY_ENV_OVERRIDE = "CODEX_DISPATCH_AGY";
 const FINGERPRINT_HASH_MAX = 8 * 1024 * 1024;
 /** ignored 清單的例外：範本檔（node_modules 裡常見）不含祕密；visible 清單維持 review 同一套規則 */
 const SECRET_TEMPLATE_RE = /(^|\/)\.env\.(example|sample|template|dist)$/i;
+/** 淨化副本：單檔超過這個大小不複製（規劃用不到二進位／大資料檔） */
+const SANDBOX_FILE_MAX = 8 * 1024 * 1024;
+const SANDBOX_PREFIX = "codex-dispatch-agy-";
+const NODE_MODULES_RE = /(^|\/)node_modules\//;
+
+/**
+ * 淨化副本：agy 沒有任何「AI 排除清單」，read_file 對 --add-dir 內任何路徑都讀（含 .gitignore 忽略的檔）。
+ * 唯一可靠的排除法是根本不把檔案放進去——把 git 看得到的檔（tracked＋untracked，**不含 ignored**）複製到臨時目錄，
+ * 複製時跳過疑似機密檔（除非 --allow-secrets）、node_modules、symlink、超大檔；agy 只拿到副本。
+ * 回 { dir, copied, excluded, skipped } 或 { error }。
+ */
+function buildAgySandbox(root, visible, { allowSecrets = false } = {}) {
+  let dir;
+  try {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), SANDBOX_PREFIX));
+  } catch (err) {
+    return { error: `無法建立淨化副本目錄：${err.message}` };
+  }
+  const excluded = [];
+  const skipped = { nodeModules: 0, symlink: 0, large: 0, missing: 0 };
+  let copied = 0;
+  try {
+    for (const rel of visible) {
+      if (NODE_MODULES_RE.test(rel)) {
+        skipped.nodeModules += 1;
+        continue;
+      }
+      if (!allowSecrets && secretPaths([rel]).length) {
+        excluded.push(rel);
+        continue;
+      }
+      const src = path.join(root, ...rel.split("/"));
+      let st;
+      try {
+        st = fs.lstatSync(src);
+      } catch {
+        skipped.missing += 1;
+        continue;
+      }
+      if (st.isSymbolicLink()) {
+        skipped.symlink += 1; // 不跟 symlink：可能指到 repo 外
+        continue;
+      }
+      if (!st.isFile()) continue;
+      if (st.size > SANDBOX_FILE_MAX) {
+        skipped.large += 1;
+        continue;
+      }
+      const dst = path.join(dir, ...rel.split("/"));
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      fs.copyFileSync(src, dst);
+      copied += 1;
+    }
+  } catch (err) {
+    removeAgySandbox(dir);
+    return { error: `建立淨化副本失敗：${err.message}` };
+  }
+  return { dir, copied, excluded, skipped };
+}
+
+function removeAgySandbox(dir) {
+  if (!dir || !path.basename(dir).startsWith(SANDBOX_PREFIX)) return; // 只刪自己建的
+  try {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
+  } catch {
+    /* 留在 %TEMP%，不影響結果 */
+  }
+}
+
+/** agy 的回應會提到副本的絕對路徑（file:// 連結、正斜線、原生分隔）；全部換回真實 root，計畫才指得到檔案 */
+function rewriteSandboxPaths(text, sandboxDir, root) {
+  if (!text || !sandboxDir) return text;
+  const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const fwd = (x) => x.replace(/\\/g, "/");
+  const flags = process.platform === "win32" ? "gi" : "g";
+  const jsonEsc = (x) => x.replace(/\\/g, "\\\\");
+  const pairs = [
+    [fwd(sandboxDir), fwd(root)],
+    [jsonEsc(sandboxDir), jsonEsc(root)], // raw JSON 文字裡的形式；要在原生形式之前
+    [sandboxDir, root]
+  ];
+  let sandboxUrl = null;
+  let rootUrl = null;
+  try {
+    sandboxUrl = new URL(`file:///${fwd(sandboxDir).replace(/^\//, "")}`).href.replace(/\/$/, "");
+    rootUrl = new URL(`file:///${fwd(root).replace(/^\//, "")}`).href.replace(/\/$/, "");
+  } catch {
+    sandboxUrl = null;
+  }
+  if (sandboxUrl && rootUrl) pairs.unshift([sandboxUrl, rootUrl]);
+  let out = text;
+  for (const [from, to] of pairs) {
+    if (from === to) continue;
+    out = out.replace(new RegExp(esc(from), flags), () => to);
+  }
+  return out;
+}
 
 /**
  * 找 agy：環境變數覆寫 → PATH（Windows 只認 .exe/.com；.cmd/.bat 在 Node ≥18.20 不能無 shell spawn，本指令永不用 shell）
@@ -950,10 +1049,11 @@ function resolveOutputPath({ output, prompt, roots, cfg, force }) {
   return { abs, rel: path.relative(owner, abs).split(path.sep).join("/") };
 }
 
-function buildArchitectPrompt(request) {
+function buildArchitectPrompt(request, { sandboxNote = null } = {}) {
   return [
     "You are a senior software architect acting as a READ-ONLY planning assistant for a coding agent.",
     "Produce an implementation plan for the request below, grounded in the repository in the current workspace. Read as much of the codebase as you need.",
+    ...(sandboxNote ? [sandboxNote] : []),
     "",
     "Hard rules:",
     "- READ-ONLY: do not create, modify, or delete any file; do not run shell commands. You are in plan mode; writes are blocked anyway.",
@@ -1041,7 +1141,7 @@ function formatPlanMarkdown({ response, prompt, conversationId, durationMs }) {
 async function cmdPlanArchitect(argv) {
   const { options, positionals } = parseArgv(argv, {
     valueOptions: ["cwd", "output", "model", "effort", "timeout"],
-    booleanOptions: ["json", "force", "allow-secrets"]
+    booleanOptions: ["json", "force", "allow-secrets", "no-sandbox-copy"]
   });
   const K = "plan-architect";
   const fail = (error, extra) => emit(localError(K, error, extra), options.json, renderPlanArchitect);
@@ -1065,20 +1165,46 @@ async function cmdPlanArchitect(argv) {
   if (!gitTopLevel(root)) return fail(`${root} 不是 git repo；機密閘門要靠 git 列舉工作區檔案，請先 git init`);
   const out = resolveOutputPath({ output: options.output, prompt, roots, cfg, force: Boolean(options.force) });
   if (out.error) return fail(out.error);
-  // 機密閘門：agy 讀整個 --add-dir 工作區（含 .gitignore 忽略的檔、submodule、巢狀 repo），列不出來就拒絕
+  // 列舉整個工作區（tracked＋untracked＋ignored，遞迴 submodule 與巢狀 repo）；列不出來就拒絕（fail-closed）
   const listed = gitWorkspaceFiles(root);
   if (listed.error) return fail(`無法列舉工作區檔案（機密閘門 fail-closed）：${listed.error}`);
-  const scan = [...listed.visible, ...listed.ignored.filter((p) => !SECRET_TEMPLATE_RE.test(p))];
-  const gate = secretGate(scan, options["allow-secrets"], "交給 Antigravity（agy 會讀整個工作區，含 .gitignore 忽略的檔，內容會送到 Google）");
-  if (gate) return fail(`${gate}。monorepo／submodule 佈局請改 --cwd <子 repo> 把審查根縮到要規劃的專案`);
+  const direct = Boolean(options["no-sandbox-copy"]);
+  let workspace = null;
+  if (direct) {
+    // 直接把真目錄交給 agy：它讀得到任何檔（含 ignored），所以任一疑似機密檔都整個拒絕
+    const scan = [...listed.visible, ...listed.ignored.filter((p) => !SECRET_TEMPLATE_RE.test(p))];
+    const gate = secretGate(scan, options["allow-secrets"], "交給 Antigravity（--no-sandbox-copy：agy 會讀整個真目錄，含 .gitignore 忽略的檔，內容會送到 Google）");
+    if (gate) return fail(`${gate}。拿掉 --no-sandbox-copy 改用淨化副本（機密檔與 ignored 檔根本不會複製給 agy），或 monorepo／submodule 佈局改 --cwd <子 repo>`);
+    workspace = { mode: "direct", root, sandboxDir: null, files: listed.visible.length + listed.ignored.length, excluded: [], skipped: null };
+  }
 
-  const common = { reviewRoot: roots.reviewRoot, configRoot: roots.configRoot, prompt, output: null, outputRel: null, fallback: null, agy: null };
+  const common = { reviewRoot: roots.reviewRoot, configRoot: roots.configRoot, prompt, output: null, outputRel: null, fallback: null, agy: null, workspace };
   const found = findAgy();
   if (!found.ok) return emit({ ...base(K, common), reason: found.reason, error: found.error, fallback: "claude" }, options.json, renderPlanArchitect);
 
+  let sandbox = null;
+  if (!direct) {
+    sandbox = buildAgySandbox(root, listed.visible, { allowSecrets: Boolean(options["allow-secrets"]) });
+    if (sandbox.error) return fail(sandbox.error);
+    workspace = { mode: "sandbox-copy", root, sandboxDir: sandbox.dir, files: sandbox.copied, excluded: sandbox.excluded, skipped: sandbox.skipped };
+    common.workspace = workspace;
+  }
+  const agyRoot = sandbox ? sandbox.dir : root;
+  const sandboxNote = sandbox
+    ? `The workspace is a READ-ONLY sanitized copy of the repository located at ${root} (ignored files, secrets and node_modules were left out on purpose). Refer to files by repository-relative paths; never mention the copy's absolute path.`
+    : null;
+
   const before = workspaceFingerprint(root);
-  if (before === null) return fail("無法取得工作區指紋（執行前）：git status 失敗");
-  const r = runAgy(found, { root, prompt: buildArchitectPrompt(prompt), model: options.model, effort: options.effort, timeoutSec });
+  if (before === null) {
+    removeAgySandbox(sandbox?.dir);
+    return fail("無法取得工作區指紋（執行前）：git status 失敗");
+  }
+  let r;
+  try {
+    r = runAgy(found, { root: agyRoot, prompt: buildArchitectPrompt(prompt, { sandboxNote }), model: options.model, effort: options.effort, timeoutSec });
+  } finally {
+    removeAgySandbox(sandbox?.dir); // 副本用完即刪，不留在 %TEMP%
+  }
   const result = base(K, { ...common, attempts: 1, agy: { bin: found.bin, model: options.model ?? null, effort: options.effort ?? null, conversationId: null, durationMs: r.durationMs, timeoutSec, usage: null } });
   // 第三層：agy 應該只讀；工作區有任何變動就不採用它的輸出
   const after = workspaceFingerprint(root);
@@ -1089,6 +1215,10 @@ async function cmdPlanArchitect(argv) {
     return emit(result, options.json, renderPlanArchitect);
   }
   const it = interpretAgy(r);
+  if (sandbox) {
+    // 解析後才回寫：stdout 是 JSON，原生反斜線在裡面是逸出過的
+    for (const k of ["response", "error", "raw"]) if (typeof it[k] === "string") it[k] = rewriteSandboxPaths(it[k], sandbox.dir, root);
+  }
   if (!it.ok) {
     Object.assign(result, { reason: it.reason, error: it.error, raw: it.raw ?? null, fallback: "claude" });
     return emit(result, options.json, renderPlanArchitect);
@@ -1132,7 +1262,16 @@ function renderPlanArchitect(r) {
     preview = "";
   }
   const a = r.agy ?? {};
-  return `# Antigravity plan-architect\nOutput: ${r.output}\nagy: ${a.bin ?? "?"}  model=${a.model ?? "default"}  effort=${a.effort ?? "default"}  ${Math.round((a.durationMs ?? 0) / 1000)}s  conversation=${a.conversationId ?? "?"}\n\n${preview}\n…\n\n## Next steps\n${(r.nextSteps ?? []).map((s) => `- ${s}`).join("\n")}\n`;
+  return `# Antigravity plan-architect\nOutput: ${r.output}\nagy: ${a.bin ?? "?"}  model=${a.model ?? "default"}  effort=${a.effort ?? "default"}  ${Math.round((a.durationMs ?? 0) / 1000)}s  conversation=${a.conversationId ?? "?"}\n${renderWorkspaceLine(r.workspace)}\n${preview}\n…\n\n## Next steps\n${(r.nextSteps ?? []).map((s) => `- ${s}`).join("\n")}\n`;
+}
+
+function renderWorkspaceLine(w) {
+  if (!w) return "";
+  if (w.mode === "direct") return `workspace: 真目錄（--no-sandbox-copy）${w.root}\n`;
+  const sk = w.skipped ?? {};
+  const parts = [`workspace: 淨化副本，複製 ${w.files} 檔（不含 ignored${sk.nodeModules ? `、node_modules ${sk.nodeModules}` : ""}${sk.large ? `、>8MB ${sk.large}` : ""}${sk.symlink ? `、symlink ${sk.symlink}` : ""}）`];
+  if (w.excluded?.length) parts.push(`⚠ 已排除疑似機密檔（未交給 Antigravity）：${w.excluded.join(", ")}`);
+  return `${parts.join("\n")}\n`;
 }
 
 // ---------- resolve / quota / preflight ----------
