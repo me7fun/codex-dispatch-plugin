@@ -24,7 +24,7 @@ Claude Code plugin：**「Claude 寫、Codex 審」的調度規則**。
 | 情境 | 行為 |
 |---|---|
 | 估計改動 >50 行或 >3 檔 | **Antigravity CLI 先出規劃草案**（選配、唯讀；沒裝或失敗就自動降級為 Claude 自己寫）→ Claude 審閱修訂 → Codex 審計畫 → 採納後才實作 |
-| 實作完成 | Codex 審 diff（結構化 findings，**內建嚴重度校準**：HIGH 只算單人正常操作會碰到的缺陷、低信心 finding 另列不自動修、沒有 HIGH 即 approve）：critical/high **先驗證能複現再修**、重審（上限 3 輪；到頂剩下的只呈現不修，交使用者）；medium/low 交使用者 |
+| 實作完成 | Codex 審 diff（結構化 findings）：**只送一次**（`maxRounds=1`）。所有 findings **不分 severity** 走同一套複現閘門——**複現得了就修、複現不了就丟棄**，修完不重送。收工給一句摘要，不要使用者判斷 severity |
 | 同一 bug 修 2 次失敗 | 交 Codex 救援（唯讀診斷，Claude 套用建議） |
 | 使用者說「嚴格審查」 | `--strict` 全對抗 review（不校準），**只跑一次**當最終稽核，不進迴圈 |
 | 小改動 | 不送審 |
@@ -87,7 +87,7 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
   "quotaThreshold": 95,
   "lineThreshold": 50,
   "fileThreshold": 3,
-  "maxRounds": 3,
+  "maxRounds": 1,
   "onCodexUnavailable": "auto",
   "reviewMode": "adversarial",
   "planDir": "plans",
@@ -106,7 +106,7 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 - `selfReview`：Codex 不可用時的降級——`auto`（審 diff 失敗自動由 Claude 唯讀 subagent 自審）｜`ask`（每次先問）｜`off`。自審過的條目仍留在未審清單（標「[自審]」），額度恢復後仍建議補審。prompt 有三個變體（審 diff／審計畫／rescue 重新診斷）在 `prompts/self-review.md`。手動的 `/codex-dispatch:review` 不會自審，它只回報 Codex 結果。
 - `reviewMode`：`adversarial`（結構化 JSON＋嚴重度校準，自動迴圈用）｜`native`（Codex 原生審查，純文字，只呈現不自動修）
 
-**為什麼要校準**：官方 adversarial prompt 的定義是「只要有任何實質風險就 needs-attention，找不到任何可成立的對抗性發現才 approve」——它是拿來打擊信心的最終稽核，不是拿來收斂的。直接用它跑迴圈，每批改動都會跑滿 3 輪、而且越修越偏向「兩個視窗同一毫秒」這類極端情境（本 repo 早期就是這樣，留下一堆「修了但沒再審」的尾巴）。社群做法與研究一致：迴圈用一般審查、2–3 輪收斂、confidence ≥ 0.75 才算、對抗式只在最後跑一次；另有研究指出 Codex 審 Claude 的碼會過度修正，所以修 HIGH 前先驗證能複現。詳見 `plans/` 審查紀錄。
+**為什麼不跑迴圈**：官方 adversarial prompt 的定義是「只要有任何實質風險就 needs-attention」——它是拿來打擊信心的最終稽核，不是拿來收斂的。但真正的問題不在它嚴不嚴。實測（2026-09-17）：同一份 diff、同一份 prompt 連跑三次，兩個核心 bug **三次都抓到**，位置與機制完全一致；漂移的是 **severity 標籤**——同一個 bug 在 HIGH／MEDIUM 之間跳。拿這種標籤決定「要不要再送一輪」等於擲骰子，而一次 adversarial review ≈ 半個 5 小時額度窗，跑滿 3 輪必然撞上限、退回 Claude 自審。所以改成：**送一次、不分 severity、用「能不能複現」當閘門**（研究指出 Codex 審 Claude 的碼會過度修正，複現是唯一防線）。重送買到的只是「審一份你剛改過的新 diff」，那是沒審過的新料，不是驗收。對抗式全開的 `--strict` 只在使用者明說「嚴格審查」時跑一次，不進迴圈。詳見 `plans/` 審查紀錄。
 
 ## 機械檢查先行（Ground Truth）
 

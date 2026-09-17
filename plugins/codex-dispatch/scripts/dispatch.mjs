@@ -406,7 +406,7 @@ function calibrationText(threshold) {
     "Severity calibration (mandatory, overrides any default rubric):",
     "- CRITICAL/HIGH only for defects a single user hits in normal operation with default configuration.",
     "- Scenarios that require multiple concurrent sessions, races between separate processes, an external editor modifying files mid-operation, clock changes, or multi-hour suspensions are MEDIUM at most.",
-    `- Do not report a finding unless your confidence is >= ${threshold}; omit speculative items entirely.`,
+    `- Report every defect you can substantiate with a concrete failure scenario, and give each one its confidence value. Do NOT omit a finding merely because its confidence is below ${threshold} — it will be triaged downstream, not auto-applied.`,
     "- Verdict rule: 'approve' when no CRITICAL or HIGH finding remains; 'needs-attention' only when at least one CRITICAL or HIGH remains.",
     "Review focus:"
   ].join("\n");
