@@ -121,6 +121,12 @@ export function loadState(root, { staleHours = STALE_HOURS } = {}) {
 
 const LOCK_STALE_MS = 60_000; // 持鎖內的操作都應在幾秒內完成；超過視為程序已死
 const LOCK_WAIT_MS = 5_000;
+/**
+ * 本程序目前持有的鎖 token（完整值）。lockStillOwned 必須比對它——只比 PID 前綴會在鎖
+ * 被別人判定 stale 搶走後仍回 true（同 PID 的任何鎖都算自己的），等於沒有防線。
+ * 巢狀加鎖時以區域變數堆疊還原。
+ */
+let currentLockToken = null;
 
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -141,6 +147,7 @@ export function withLockFile(file, fn) {
   fs.mkdirSync(path.dirname(lock), { recursive: true });
   const deadline = Date.now() + LOCK_WAIT_MS;
   const token = `${process.pid}:${crypto.randomBytes(6).toString("hex")}`; // 擁有者 token：釋放時只刪自己的鎖
+  const prevLockToken = currentLockToken;
   let fd = null;
   for (;;) {
     try {
@@ -170,9 +177,11 @@ export function withLockFile(file, fn) {
       sleepSync(50);
     }
   }
+  currentLockToken = token;
   try {
     return fn();
   } finally {
+    currentLockToken = prevLockToken; // 巢狀加鎖時還原外層
     try {
       fs.closeSync(fd);
     } catch {
@@ -193,9 +202,10 @@ export function withLockFile(file, fn) {
 /** 呼叫端可用來確認自己仍持有鎖（被搶走則回 false）。fn 內部長操作後、破壞性動作前使用。 */
 export function lockStillOwned(root) {
   const lock = `${stateFile(root)}.lock`;
+  if (!currentLockToken) return false; // 根本沒持鎖
   try {
     const owner = fs.readFileSync(lock, "utf8").split(" ")[0];
-    return owner.startsWith(`${process.pid}:`);
+    return owner === currentLockToken; // 完整 token 比對，不是 PID 前綴
   } catch {
     return false;
   }

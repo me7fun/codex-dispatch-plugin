@@ -32,8 +32,10 @@ const HEADING_RE = new RegExp(
   "i"
 );
 const FENCE_RE = /^[ \t]*(?:>[ \t]*)*(`{3,}|~{3,})/;
-// 只認「node <路徑>dispatch.mjs <子指令>」這種真正的呼叫；echo／註解／引用文字不算。單一 shell 片段內（不跨 | & ;）。
-const INVOKE_RE = /(?:^|[|&;]\s*)node\b[^|&;]*?[\\/]dispatch\.mjs["']?\s+(?:review|plan-review|rescue|state\s+--add-unreviewed)\b/;
+// 只認「node <路徑>dispatch.mjs <子指令>」這種真正的呼叫；echo／註解／引用文字不算。單一 shell 片段內（不跨 | & ; 或換行）。
+// 換行也算分隔符：多行指令裡的呼叫必須認得，否則閘門靜默失效。
+// state 與 --add-unreviewed 之間允許夾旗標：submodule 佈局規定要帶 --cwd（SKILL 觸發規則 2），寫死相鄰會漏掉。
+const INVOKE_RE = /(?:^|[|&;\n]\s*)node\b[^|&;\n]*?[\\/]dispatch\.mjs["']?\s+(?:review|plan-review|rescue|state\b[^|&;\n]*?--add-unreviewed)\b/;
 
 function out(obj) {
   process.stdout.write(`${JSON.stringify(obj)}\n`);
@@ -134,7 +136,9 @@ function mark(data) {
 }
 
 function gate(data) {
-  if (data.stop_hook_active) return out({});
+  // stop_hook_active 的放行**不能**放在這裡：被擋之後的 continuation 輪也必須先走到下面的
+  // hasHeading，把 ackDigest 記下來；否則標題加了卻沒記錄，使用者下一輪正常對話會被要求
+  // 為同一批未審再標一次。放行點移到 hasHeading 之後、任何 block 決策之前。
   const p = flagFile(data);
   const st = readFlag(p);
   if (!st.touched) return out({});
@@ -159,6 +163,11 @@ function gate(data) {
   const last = typeof data.last_assistant_message === "string" ? data.last_assistant_message : "";
   if (hasHeading(last)) {
     writeFlag(p, { touched: true, blockCount: 0, ackDigest: digest });
+    return out({});
+  }
+  // 防遞迴：continuation 輪永不擋。blockCount 歸零，不讓它洩到下一輪（否則下一輪只剩 1 次額度）
+  if (data.stop_hook_active) {
+    writeFlag(p, { ...st, blockCount: 0 });
     return out({});
   }
   if (st.ackDigest === digest) return out({}); // 同一批未審已在先前回覆標過
