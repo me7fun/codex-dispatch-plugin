@@ -3,6 +3,8 @@
  * - atomic write（temp + rename）
  * - 條目帶 createdAt；超過 staleHours 只標示 stale=true，**不自動刪除**（未審是義務，只能由明確的 clear 解除）
  * - 條目存 repoRoot / headSha / scope / changedPaths，供日後補審對照
+ * - snapshots[cycleKey] = { tree, findings, stage, at }：上一次送審時的 working tree 快照（git tree SHA）與當時的 findings，
+ *   `review --verify` 用它算出「之後才改的部分」。有快照＝這批改動已整份審過，之後只能驗收修正。
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -25,7 +27,7 @@ const ROUNDS_TTL_DAYS = 7;
 const ACTIVE_STALE_MS = 2 * 60 * 60 * 1000;
 
 function empty() {
-  return { version: VERSION, reviewRoot: null, unreviewed: [], rounds: {}, roundsAt: {}, roundsActive: {}, updatedAt: null };
+  return { version: VERSION, reviewRoot: null, unreviewed: [], rounds: {}, roundsAt: {}, roundsActive: {}, snapshots: {}, updatedAt: null };
 }
 
 function touchRound(st, key) {
@@ -36,6 +38,12 @@ function dropRound(st, key) {
   delete st.rounds[key];
   delete st.roundsAt[key];
   delete st.roundsActive[key];
+}
+
+/** 整個 cycle 結束（沒有 finding、使用者重置、過期）：輪次與快照一起清 */
+function dropCycle(st, key) {
+  dropRound(st, key);
+  delete st.snapshots[key];
 }
 
 function activeIds(st, key) {
@@ -84,15 +92,21 @@ export function loadState(root, { staleHours = STALE_HOURS } = {}) {
   if (!st.rounds || typeof st.rounds !== "object") st.rounds = {};
   if (!st.roundsAt || typeof st.roundsAt !== "object") st.roundsAt = {};
   if (!st.roundsActive || typeof st.roundsActive !== "object") st.roundsActive = {};
+  if (!st.snapshots || typeof st.snapshots !== "object" || Array.isArray(st.snapshots)) st.snapshots = {};
   // 輪次計數過期清理：沒時間戳的舊資料視為現在起算
   const roundsCutoff = Date.now() - ROUNDS_TTL_DAYS * 24 * 3600 * 1000;
   st.roundsPruned = 0;
   for (const key of Object.keys(st.rounds)) {
     if (!st.roundsAt[key]) touchRound(st, key);
     else if (Date.parse(st.roundsAt[key]) < roundsCutoff) {
-      dropRound(st, key);
+      dropCycle(st, key);
       st.roundsPruned += 1;
     }
+  }
+  // 快照自己也有 TTL（reviewer=claude 的快照沒有對應的輪次計數）；格式不對的直接丟
+  for (const key of Object.keys(st.snapshots)) {
+    const s = st.snapshots[key];
+    if (!s || typeof s !== "object" || typeof s.tree !== "string" || !(Date.parse(s.at) >= roundsCutoff)) delete st.snapshots[key];
   }
   for (const key of Object.keys(st.roundsAt)) if (!(key in st.rounds)) delete st.roundsAt[key];
   // 進行中佔用：程序死掉沒釋放的（超過 ACTIVE_STALE_MS）清掉
@@ -277,7 +291,7 @@ export function reserveRound(root, key, max) {
 }
 
 /**
- * 審查完成：只移除自己的 reservationId。approve 且**沒有任何其他進行中的佔用**才清整個 cycle。
+ * 審查完成：只移除自己的 reservationId。approve（呼叫端定義：這次送審沒有留下任何要處理的 finding）且**沒有任何其他進行中的佔用**才清整個 cycle（含快照）。
  * 別的 session 還在審 → 只解除自己的登記，計數保留；它們完成時再判斷。
  * 回 true 表示 cycle 已清。
  */
@@ -287,7 +301,7 @@ export function completeRound(root, key, reservationId, { approve = false } = {}
     if (st.roundsActive[key]) delete st.roundsActive[key][reservationId];
     const othersActive = activeIds(st, key).length > 0;
     if (approve && !othersActive) {
-      dropRound(st, key);
+      dropCycle(st, key);
       saveState(root, st);
       return true;
     }
@@ -423,11 +437,32 @@ export function purgeAllStates(configRoot) {
 export function resetRounds(root, key = null) {
   withLock(root, () => {
     const st = loadState(root);
-    if (key) dropRound(st, key);
+    if (key) dropCycle(st, key);
     else {
       st.rounds = {};
       st.roundsAt = {};
+      st.snapshots = {};
     }
     saveState(root, st);
+  });
+}
+
+/** 讀某個 cycle 的快照（沒有回 null）。state 檔是 rename 原子寫入，唯讀不必加鎖（也不會為了讀而建出 state 目錄）。 */
+export function getSnapshot(root, key) {
+  return loadState(root).snapshots[key] ?? null;
+}
+
+/** 目前已用輪次（未加鎖的參考值；真正的上限檢查在 reserveRound 的鎖內）。 */
+export function roundsUsed(root, key) {
+  return loadState(root).rounds[key] || 0;
+}
+
+/** 存／滾動某個 cycle 的快照。findings 為 null 表示 CLI 手上沒有（reviewer=claude：findings 在 Claude 的對話裡）。 */
+export function saveSnapshot(root, key, { tree, findings = null, stage }) {
+  return withLock(root, () => {
+    const st = loadState(root);
+    st.snapshots[key] = { tree, findings, stage, at: new Date().toISOString() };
+    saveState(root, st);
+    return st.snapshots[key];
   });
 }

@@ -91,8 +91,8 @@ try {
         claudeOnly ? "[codex-dispatch] 本專案啟用 Claude 自審（reviewer=claude，Codex 已停用）：" : "[codex-dispatch] 本專案啟用「Claude 寫、Codex 審」：",
         `- 估計改動 >50 行或 >3 檔（或使用者說「先寫計畫」）→ ${planStep} → ${planReview} → 再實作。`,
         claudeOnly
-          ? "- 實作完成 → 自審 diff（Claude 唯讀 subagent，上限 2 輪）；critical/high 修正後重審，medium/low 交使用者決定。"
-          : "- 實作完成 → 送 Codex 審 diff；critical/high 修正後重審（上限 3 輪），medium/low 交使用者決定。",
+          ? "- 實作完成 → 自審 diff（Claude 唯讀 subagent）整份 1 次；findings 逐條查證（要有失敗的測試或實際錯誤輸出才算真 bug），真 bug 就修、不分 severity，不算的收工列出；修完 `review --verify` 只驗收修正的部分（最多 2 次），仍未過交使用者。"
+          : "- 實作完成 → 送 Codex 審 diff 整份 1 次；findings 逐條查證（要有失敗的測試或實際錯誤輸出才算真 bug），真 bug 就修、不分 severity，不算的收工列出；修完 `review --verify` 只驗收修正的部分（最多 2 次），仍未過交使用者。",
         claudeOnly ? "- 同一 bug 修 2 次失敗 → 自審救援（subagent 重新診斷）。小改動不審。" : "- 同一 bug 修 2 次失敗 → 交 Codex 救援（唯讀診斷）。小改動不送審。",
         claudeOnly
           ? "- 自審是使用者的設定，不是降級：不佔 Codex 額度、不進未審清單、不加任何「未經 Codex 審查」標記、收工前步驟跳過。"

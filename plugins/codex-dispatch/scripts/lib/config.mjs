@@ -19,7 +19,7 @@ export const DEFAULTS = Object.freeze({
   quotaThreshold: 95,
   lineThreshold: 50,
   fileThreshold: 3,
-  maxRounds: 1, // 一個任務只送審一次：重送的是「你剛改過的新 diff」（新料，不是驗收），而每次 review ≈ 半個 5 小時額度窗
+  maxRounds: 3, // 同一批改動的總送審次數：整份 review 1 次＋ `review --verify`（只看修正 delta）最多 maxRounds-1 次。設 1＝只審一次、不驗收
   onCodexUnavailable: "auto", // auto | ask | continue
   reviewMode: "adversarial", // adversarial | native
   planDir: "plans",

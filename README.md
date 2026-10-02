@@ -15,7 +15,7 @@ Claude Code plugin：**「Claude 寫、Codex 審」的調度規則**。
 - **額度看得到、也擋得住**：從 Codex app-server 挖出未公開的 `account/rateLimits/read`，送審前先查（不耗額度）；≥95% 直接不送；失敗後再查一次分辨是額度還是連線。官方 issue #102「plugin 內查不到額度」在這裡不存在。
 - **絕不卡死、絕不無限重試**：官方 review gate 撞限額會無限迴圈燒掉兩邊額度（issue #306）。本 plugin 永不開 gate；Codex 失敗時審 diff→記入未審清單繼續做、審計畫／救援→問你，重試上限 1 次。
 - **Codex 掛了還有第二道**：額度用完時 Claude 開一個獨立的唯讀 subagent 自審（同一套 JSON schema、對抗式 prompt），結果照規則處理，但仍標記「未經 Codex 審查」等額度恢復補審。
-- **護欄寫在程式裡，不靠 Claude 自律**：審查輪次上限（CLI 原子強制、多視窗安全）、疑似機密檔擋送（含 rename 繞過）、未審清單不自動消失（只標 STALE）、反接線先預覽再動手。
+- **護欄寫在程式裡，不靠 Claude 自律**：整份只審一次與送審次數上限（CLI 原子強制、多視窗安全）、驗收範圍分流（不屬於這次修正的意見只呈現）、疑似機密檔擋送（含 rename 繞過）、未審清單不自動消失（只標 STALE）、反接線先預覽再動手。
 - **只審不寫**：Codex 額度花在最值得的地方——審計畫、審 diff、找根因；連救援都預設唯讀，由 Claude 套用建議。Plus 方案的 5 小時窗口撐得住。
 - **自己審自己長大**：本 repo 從第一行就走這套流程。v0.1 到 v0.1.3 共 13 輪審查（Codex 12 輪 + Claude 自審 1 輪），抓出近 30 個 HIGH——路徑逃逸、`--retries Infinity`、TOML 寫壞、rename 繞過機密閘門、輪次計數競態、TOCTOU symlink、沒 commit 的專案變終身上限……每一條都在 `plans/` 的審查紀錄裡。
 
@@ -24,7 +24,7 @@ Claude Code plugin：**「Claude 寫、Codex 審」的調度規則**。
 | 情境 | 行為 |
 |---|---|
 | 估計改動 >50 行或 >3 檔 | **Antigravity CLI 先出規劃草案**（選配、唯讀；沒裝或失敗就自動降級為 Claude 自己寫）→ Claude 審閱修訂 → Codex 審計畫 → 採納後才實作 |
-| 實作完成 | Codex 審 diff（結構化 findings）：**只送一次**（`maxRounds=1`）。所有 findings **不分 severity** 走同一套複現閘門——**複現得了就修、複現不了就丟棄**，修完不重送。收工給一句摘要，不要使用者判斷 severity |
+| 實作完成 | Codex **整份審 1 次**（結構化 findings）→ Claude **逐條查證、不照單全收**：要有失敗的測試或實際錯誤輸出才算真 bug，真 bug 就修（**不分 severity**），不算的收工逐條列出 → 修完**只把修正的部分送驗收**（`review --verify`，最多 2 次）：只問修好了沒、有沒有弄壞別的。同一批改動最多送 3 次（`maxRounds=3`），仍未過才交給你 |
 | 同一 bug 修 2 次失敗 | 交 Codex 救援（唯讀診斷，Claude 套用建議） |
 | 使用者說「嚴格審查」 | `--strict` 全對抗 review（不校準），**只跑一次**當最終稽核，不進迴圈 |
 | 小改動 | 不送審 |
@@ -74,7 +74,7 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 |---|---|
 | `/codex-dispatch:setup [--write] [--local]` | 前置檢查 + 接線（CLAUDE.md 或 CLAUDE.local.md） |
 | `/codex-dispatch:status` | Codex 額度（不耗額度）+ 未審清單 |
-| `/codex-dispatch:review [--adversarial\|--native\|--strict] [--base ref] [--scope s] [focus]` | 手動送審目前改動（`--strict` = 全對抗最終稽核） |
+| `/codex-dispatch:review [--adversarial\|--native\|--strict] [--verify [--fixed 1,3]] [--base ref] [--scope s] [focus]` | 手動送審目前改動（`--strict` = 全對抗最終稽核；`--verify` = 只驗收上次送審之後的修正） |
 | `/codex-dispatch:uninstall [--purge-config] [--purge-state]` | 反接線：移除 CLAUDE.md 段（預設只預覽、再確認），可選一併 `claude plugin uninstall` |
 
 平常不需要打指令——SessionStart hook 會注入規則摘要，Claude 依 Skill `codex-dispatch:dispatch` 自動調度。
@@ -87,7 +87,7 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
   "quotaThreshold": 95,
   "lineThreshold": 50,
   "fileThreshold": 3,
-  "maxRounds": 1,
+  "maxRounds": 3,
   "onCodexUnavailable": "auto",
   "reviewMode": "adversarial",
   "planDir": "plans",
@@ -98,15 +98,16 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
   "plannerAllowSecrets": false
 }
 ```
-- `reviewer`：`codex`（預設）｜`claude`——**只停用 Codex 審查與救援**：審 diff／審計畫／救援全改由 Claude 唯讀 subagent 自審（同一套 prompt 與 findings 規則，自審上限 2 輪）。這是你的決定，不是降級：不查額度、不佔輪次、不記未審清單、不加「未經 Codex 審查」標題、Stop hook 放行、`preflight` 把 Codex 相關檢查標為略過。沒裝 Codex 的人設這個就能用整套流程。
+- `reviewer`：`codex`（預設）｜`claude`——**只停用 Codex 審查與救援**：審 diff／審計畫／救援全改由 Claude 唯讀 subagent 自審（同一套 prompt 與 findings 規則，次數也相同：整份 1 次＋驗收最多 2 次）。這是你的決定，不是降級：不查額度、不佔輪次、不記未審清單、不加「未經 Codex 審查」標題、Stop hook 放行、`preflight` 把 Codex 相關檢查標為略過。沒裝 Codex 的人設這個就能用整套流程。
 - `planner`：`auto`（預設，有 `agy` 就先出草案）｜`off`（不用 Antigravity）。要**完全不碰外部 AI**要兩個都關：`{ "reviewer": "claude", "planner": "off" }`。
 - `plannerAllowSecrets`：`false`（預設）｜`true`＝**強制讀取**。agy 讀的是整個工作區、連 `.gitignore` 忽略的檔都讀，又沒有任何排除清單，所以預設只要工作區裡有一個疑似機密檔（`.npmrc`、`*.key`、`.env`…，含子 repo 與 node_modules）就整個拒絕。設 `true` 就不再拒絕，等於每次都帶 `--allow-secrets`；代價是那些檔的內容可能被 agy 讀走送到 Google。monorepo 根下有很多子 repo 的人通常需要開這個。只影響 `plan-architect`，Codex 審查的機密閘門不受影響。
-- `confidenceThreshold`：Codex 給每條 finding 的信心低於此值 → 移到 `lowConfidence`，只呈現、不自動修、不影響 verdict。
+- `confidenceThreshold`：Codex 給每條 finding 的信心低於此值 → 另列在 `lowConfidence`、不影響 verdict 標籤。處置與其他 findings 相同：一樣逐條查證、有證據才修。
 - `onCodexUnavailable`：`auto`（審 diff→繼續、審計畫/救援→詢問）｜`ask`（全部詢問）｜`continue`（全部繼續）
-- `selfReview`：Codex 不可用時的降級——`auto`（審 diff 失敗自動由 Claude 唯讀 subagent 自審）｜`ask`（每次先問）｜`off`。自審過的條目仍留在未審清單（標「[自審]」），額度恢復後仍建議補審。prompt 有三個變體（審 diff／審計畫／rescue 重新診斷）在 `prompts/self-review.md`。手動的 `/codex-dispatch:review` 不會自審，它只回報 Codex 結果。
-- `reviewMode`：`adversarial`（結構化 JSON＋嚴重度校準，自動迴圈用）｜`native`（Codex 原生審查，純文字，只呈現不自動修）
+- `selfReview`：Codex 不可用時的降級——`auto`（審 diff 失敗自動由 Claude 唯讀 subagent 自審）｜`ask`（每次先問）｜`off`。自審過的條目仍留在未審清單（標「[自審]」），額度恢復後仍建議補審；這種降級自審只做一次、不做驗收（補審成功後才走正常的驗收流程）。prompt 有四個變體（審 diff／審計畫／rescue 重新診斷／驗收修正）在 `prompts/self-review.md`。手動的 `/codex-dispatch:review` 不會自審，它只回報 Codex 結果。
+- `reviewMode`：`adversarial`（結構化 JSON＋嚴重度校準；查證 → 修 → 驗收的流程用這個）｜`native`（Codex 原生審查，純文字，只呈現不自動修、不進驗收）
+- `maxRounds`：同一批未 commit 改動的總送審次數，預設 3（整份 1 次＋驗收最多 2 次）。設 1＝只審一次、不驗收。`--strict` 與 native 不進驗收流程，只受這個總數限制。
 
-**為什麼不跑迴圈**：官方 adversarial prompt 的定義是「只要有任何實質風險就 needs-attention」——它是拿來打擊信心的最終稽核，不是拿來收斂的。但真正的問題不在它嚴不嚴。實測（2026-09-17）：同一份 diff、同一份 prompt 連跑三次，兩個核心 bug **三次都抓到**，位置與機制完全一致；漂移的是 **severity 標籤**——同一個 bug 在 HIGH／MEDIUM 之間跳。拿這種標籤決定「要不要再送一輪」等於擲骰子，而一次 adversarial review ≈ 半個 5 小時額度窗，跑滿 3 輪必然撞上限、退回 Claude 自審。所以改成：**送一次、不分 severity、用「能不能複現」當閘門**（研究指出 Codex 審 Claude 的碼會過度修正，複現是唯一防線）。重送買到的只是「審一份你剛改過的新 diff」，那是沒審過的新料，不是驗收。對抗式全開的 `--strict` 只在使用者明說「嚴格審查」時跑一次，不進迴圈。詳見 `plans/` 審查紀錄。
+**為什麼整份只審一次、之後只驗收修正**：早期版本每輪都把整份 diff 重送，結果每輪都冒出新意見、幾乎每次都跑滿 3 輪——審查者每輪看到的都是一份「你剛改過的新 diff」，而官方 adversarial prompt 的定義是「只要有任何實質風險就 needs-attention」，它永遠挑得出東西；額度也撐不住（2026-09-17 觀測：連續兩次整份 adversarial review 把 5 小時額度窗從 4% 用到 100%）。v0.1.18 曾改成「只送一次、修完不重送」，但那留下兩個洞：修正的程式碼沒人看，而 finding 算不算數全憑 Claude 讀自己的碼判斷。現在的做法把挑刺的兩個來源分開擋：**算不上 bug 的刺**由查證擋（要有失敗的測試或實際錯誤輸出才修）；**越送越多的刺**由驗收範圍擋（`review --verify` 只送上次送審之後的 delta，只問兩個封閉題，回來的意見不屬於這次修正範圍的由 CLI 分到 `outOfScope`、只呈現）。severity 不參與任何決定：實測同一份 diff、同一份 prompt 連跑三次，兩個核心 bug **三次都抓到**，漂移的只有 severity 標籤（同一個 bug 在 HIGH／MEDIUM 之間跳）。對抗式全開的 `--strict` 只在使用者明說「嚴格審查」時跑一次，不進這個流程。成本實測（2026-10-02，本 repo 用這套流程審它自己）：整份審 11 檔約 1000 行用掉 5 小時窗的 2 個百分點，兩次驗收（各 3–5 KB 的 delta）合計 1 個百分點——整份審的成本隨當時狀況差很多，但驗收只送修正的 delta，遠比整份審便宜。詳見 `plans/review-verify-loop.md`。
 
 ## 機械檢查先行（Ground Truth）
 
@@ -142,7 +143,7 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 ## 底層 CLI
 
 所有 Codex 呼叫走 `plugins/codex-dispatch/scripts/dispatch.mjs`（`--json` 回統一結果物件；exit 0 成功、1 Codex 端失敗、2 本地錯誤）：
-`resolve` / `quota` / `preflight` / `plan-architect <prompt> [--output f]` / `review` / `plan-review <file>` / `rescue [--write] <prompt>` / `state` / `snippet` / `unwire`。
+`resolve` / `quota` / `preflight` / `plan-architect <prompt> [--output f]` / `review` / `review --verify [--fixed 1,3]` / `plan-review <file>` / `rescue [--write] <prompt>` / `state` / `snippet` / `unwire`。
 它會從 `~/.claude/plugins/installed_plugins.json` 找官方 plugin 的 `codex-companion.mjs` 直接執行——因為官方 review 類 slash command 設了 `disable-model-invocation`，Claude 自己呼叫不到。
 
 ## 資料與安全
@@ -152,7 +153,7 @@ claude plugin install codex-dispatch@codex-dispatch-plugin --scope local
 - CLI 送審前會擋下疑似機密檔（`.env*`、`*.pem/*.key`、`credentials.json`、`auth.json`、`.npmrc`…），回 `local-error`；確認無機密才加 `--allow-secrets`。`plan-architect` 可用設定 `plannerAllowSecrets: true` 永久放行（強制讀取）。
 - `plan-review` / `--prompt-file` 只接受專案根目錄內的一般檔案（realpath 比對，擋 symlink 逃逸）。
 - 未審清單**不會自動清除**（超過 24 小時標示 STALE）——「沒審」是義務，只有補審成功或使用者明確決定才解除。
-- 審查輪次計數（同一批未 commit 改動最多 `maxRounds` 輪）：approve 或 commit 開新一輪；7 天沒動自動清除。多個 Claude 視窗同時審同一專案是安全的（跨程序鎖 + 原子佔用）。
+- 審查次數（同一批未 commit 改動整份審 1 次、之後只能 `--verify`，總共最多 `maxRounds` 次）：沒有任何 finding 或 commit 才開新一輪；7 天沒動自動清除。驗收靠 state 檔裡的 working tree 快照（git tree SHA）算出修正 delta，不動你的 index。多個 Claude 視窗同時審同一專案是安全的（跨程序鎖 + 原子佔用）。
 
 ## 已知限制
 

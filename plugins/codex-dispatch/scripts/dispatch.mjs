@@ -10,7 +10,12 @@
  *   review [--adversarial|--native|--strict] [--base <ref>] [--scope auto|working-tree|branch] [--retries N] [--allow-secrets] [--reset-rounds] [--skip-checks] [focus...]
  *                                 送審 diff（預設模式依設定 reviewMode）。adversarial 模式自動附嚴重度校準（HIGH 限單人正常操作、
  *                                 confidence 門檻、沒有 HIGH 即 approve）；--strict 為全對抗不校準，只給「嚴格審查」用且只跑一次。
- *                                 機密檔閘門；同一批改動（repo+HEAD+目標）最多 maxRounds 輪。
+ *                                 機密檔閘門；同一批改動（repo+HEAD+目標）整份只審 1 次，之後只能 --verify；總送審次數最多 maxRounds。
+ *   review --verify [--fixed 1,3] [--base <ref>] [--scope ...] [--retries N] [--allow-secrets] [--skip-checks]
+ *                                 驗收修正：只把「上次送審之後才改的部分」（working tree 快照之間的 delta）與對應 findings 送 Codex，
+ *                                 只問修好了沒、修正有沒有弄壞別的。--fixed＝這次宣稱已修的 finding 編號（上次結果的 index；省略＝全部）。
+ *                                 --base／--scope 必須與整份審相同。沒有先前的整份審 → local-error（nextAction=full）。
+ *                                 回來的 finding 不屬於這次驗收範圍的 → outOfScope（只呈現）。不支援 --strict／--native、不收 focus 文字。
  *                                 機械檢查（ground truth）：<規則根>/.claude/codex-dispatch.local.json 的 checks 先跑，失敗 → reason=checks-failed（exit 2）不送 Codex
  *   plan-review <file> [--model m] [--effort e] [--allow-secrets]
  *                                 請 Codex 唯讀審計畫檔，要求回 JSON
@@ -45,11 +50,11 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { projectRoot, resolveRoots, gitTopLevel, gitHeadSha, gitChangedPathsForGate, gitDiffPathsForGate, gitSubmodulePaths, gitWorkspaceFiles, canonicalPath, codexHomeDir } from "./lib/paths.mjs";
+import { projectRoot, resolveRoots, gitTopLevel, gitHeadSha, gitChangedPathsForGate, gitDiffPathsForGate, gitSubmodulePaths, gitWorkspaceFiles, gitSnapshotTree, gitTreeDelta, canonicalPath, codexHomeDir } from "./lib/paths.mjs";
 import { resolveCompanion, runCompanion, parseJsonLoose, tailLines } from "./lib/companion.mjs";
 import { readQuota } from "./lib/quota.mjs";
 import { loadConfig, CONFIG_REL, LOCAL_CONFIG_REL, DEFAULTS } from "./lib/config.mjs";
-import { loadState, loadAllStates, addUnreviewed, clearUnreviewed, reserveRound, releaseRound, resetRounds, completeRound, purgeAllStates, stateFile, withLock, lockStillOwned } from "./lib/state.mjs";
+import { loadState, loadAllStates, addUnreviewed, clearUnreviewed, reserveRound, releaseRound, resetRounds, completeRound, getSnapshot, saveSnapshot, roundsUsed, purgeAllStates, stateFile, withLock, lockStillOwned } from "./lib/state.mjs";
 
 /**
  * 雙根解析：reviewRoot（改動所在 repo）＋ configRoot（規則所在，往上找到的已接線目錄）。
@@ -263,7 +268,7 @@ function quotaMessage(q) {
 }
 
 // ---------- findings 正規化 ----------
-function normalizeFindings(list) {
+function normalizeFindings(list, { verify = false } = {}) {
   if (!Array.isArray(list)) return null;
   const out = [];
   for (const f of list) {
@@ -278,18 +283,20 @@ function normalizeFindings(list) {
       line_start: Number.isInteger(f.line_start) ? f.line_start : null,
       line_end: Number.isInteger(f.line_end) ? f.line_end : null,
       confidence: typeof f.confidence === "number" ? f.confidence : null,
-      recommendation: typeof f.recommendation === "string" ? f.recommendation : ""
+      recommendation: typeof f.recommendation === "string" ? f.recommendation : "",
+      // 驗收專用：ref＝指哪一條「宣稱已修」的 finding 沒修好；caused_by_file＝造成這個新缺陷的 delta 檔
+      ...(verify ? { ref: Number.isInteger(f.ref) ? f.ref : null, caused_by_file: typeof f.caused_by_file === "string" && f.caused_by_file.trim() ? f.caused_by_file.trim() : null } : {})
     });
   }
   out.sort((a, b) => SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity));
   return out;
 }
 
-function validateStructured(obj) {
+function validateStructured(obj, opts = {}) {
   if (!obj || typeof obj !== "object") return { ok: false, error: "輸出不是 JSON 物件" };
   const verdict = String(obj.verdict || "").toLowerCase();
   if (!VERDICTS.includes(verdict)) return { ok: false, error: `verdict 不合法：${JSON.stringify(obj.verdict)}` };
-  const findings = normalizeFindings(obj.findings ?? []);
+  const findings = normalizeFindings(obj.findings ?? [], opts);
   if (!findings) return { ok: false, error: "findings 欄位格式不合法（severity/title）" };
   return {
     ok: true,
@@ -483,8 +490,8 @@ function interpretReview(mode) {
 
 async function cmdReview(argv) {
   const { options, positionals } = parseArgv(argv, {
-    valueOptions: ["base", "scope", "cwd", "retries"],
-    booleanOptions: ["json", "adversarial", "native", "strict", "allow-secrets", "reset-rounds", "skip-checks"]
+    valueOptions: ["base", "scope", "cwd", "retries", "fixed"],
+    booleanOptions: ["json", "adversarial", "native", "strict", "allow-secrets", "reset-rounds", "skip-checks", "verify"]
   });
   const roots = rootsOrFail("review", options, renderReview);
   if (!roots) return;
@@ -494,6 +501,10 @@ async function cmdReview(argv) {
   const strict = Boolean(options.strict); // 全對抗、不校準：只給「嚴格審查」用，且只跑一次
   let result_note_subs = null; // 這次 diff 裡混有 submodule 指標變更（其內容不會被審）
   const userFocus = positionals.join(" ").trim();
+  if (options.verify) return cmdVerify({ options, userFocus, roots, cfg, checksWarnings, mode, strict });
+  if (options.fixed !== undefined) return emit(localError("review", "--fixed 只能搭配 --verify"), options.json, renderReview);
+  // 只有預設的校準 adversarial 審查會進「查證 → 修 → 驗收」流程；native（純文字）與 --strict（只跑一次、不自動修）不留快照
+  const verifiable = mode === "adversarial" && !strict;
   let checksResults = []; // 稍後（所有閘門通過、佔輪次之前）執行
   const buildFocus = () =>
     mode === "adversarial" && !strict
@@ -526,6 +537,7 @@ async function cmdReview(argv) {
       : "--scope branch 找不到基準分支（只認 main/master/origin/main/origin/master）";
     return emit(localError("review", `${why}；機密閘門無法列舉 diff，拒絕送審。請確認 ref 或明確指定 --base <ref>`), options.json, renderReview);
   }
+  const cycleKey = reviewCycleKey(root, { mode, base: options.base, scope: options.scope });
   // 機械檢查（ground truth）：任一失敗 → 不送 Codex、不佔輪次。exit 2（本地分類，不是 Codex 問題）
   const runGroundTruth = () => {
     if (!cfg.checks.length || options["skip-checks"]) return null;
@@ -538,10 +550,15 @@ async function cmdReview(argv) {
     // 使用者選擇不用 Codex：不外送（免機密閘門）、不查額度、不佔輪次；只跑 ground truth，把目標交回 Skill 開自審 subagent
     const gt = runGroundTruth();
     if (gt) return emit(gt, options.json, renderReview);
+    // 自審路徑每次整份審都重新定基準（findings 在 Claude 的對話裡，CLI 不存）；之後 `review --verify` 以它算修正 delta
+    const snapC = verifiable ? gitSnapshotTree(root) : null;
+    if (snapC?.tree) saveSnapshot(root, cycleKey, { tree: snapC.tree, findings: null, stage: "full" });
     return emit(
       {
         ...base("review", { reason: "reviewer-claude", error: "reviewer=claude：Codex 已停用，請依 Skill 用 Claude 唯讀 subagent 自審（self-review.md A 變體）" }),
         reviewer: "claude",
+        stage: "full",
+        snapshotTree: snapC?.tree ?? null,
         target: { mode: target.mode, label: target.mode === "branch" ? `branch diff vs ${target.ref}` : "working tree diff", base: target.ref, scope: options.scope ?? "auto" },
         checks: checksResults,
         checksWarnings,
@@ -555,8 +572,16 @@ async function cmdReview(argv) {
   }
   const gate = secretGate(target.paths, options["allow-secrets"]);
   if (gate) return emit(localError("review", gate), options.json, renderReview);
+  // 整份審只准一次：這個 cycle 已有快照＝整份審過了。再整份送＝讓審查者對沒改的地方重新挑一輪，修完只能 --verify
+  if (verifiable && !options["reset-rounds"] && getSnapshot(root, cycleKey)) {
+    return emit(
+      localError("review", "此批改動已整份審過；修完請用 review --verify 只驗收修正的部分。要重新整份審請 commit 後開新一輪，或由使用者明說後加 --reset-rounds", { nextAction: "verify", cycleKey }),
+      options.json,
+      renderReview
+    );
+  }
 
-  // 順序：引數／根／diff／機密閘門 → 額度預檢（便宜） → 機械檢查（可能很貴） → 佔輪次 → Codex
+  // 順序：引數／根／diff／機密閘門 → 額度預檢（便宜） → 機械檢查（可能很貴） → 快照 → 佔輪次 → Codex
   const quotaEarly = await quotaFor(cfg);
   if (quotaEarly.status === "exhausted") {
     const r = base("review");
@@ -571,14 +596,15 @@ async function cmdReview(argv) {
   const gt = runGroundTruth();
   if (gt) return emit(gt, options.json, renderReview);
   const focus = buildFocus();
+  // 快照取在機械檢查之後（checks 可能是 formatter／generator，會改檔）、送 Codex 之前
+  const snap0 = verifiable ? gitSnapshotTree(root) : null;
 
   // maxRounds 由 CLI 強制：同一 cycle（repo+HEAD+目標）送審次數達上限就拒絕，交使用者裁決
-  const cycleKey = reviewCycleKey(root, { mode, base: options.base, scope: options.scope });
   if (options["reset-rounds"]) resetRounds(root, cycleKey);
   const reserved = reserveRound(root, cycleKey, cfg.maxRounds); // 檢查＋佔用在同一把鎖內
   if (!reserved.ok) {
     return emit(
-      localError("review", `此批改動已送審 ${reserved.used} 輪（maxRounds=${cfg.maxRounds}），不再自動送審；請交使用者裁決剩餘 findings。確定要再審請加 --reset-rounds，或 commit 後開新一輪`, { round: reserved.used, maxRounds: cfg.maxRounds, cycleKey }),
+      localError("review", `此批改動已送審 ${reserved.used} 次（maxRounds=${cfg.maxRounds}），不再送審；請用交還格式交使用者裁決。使用者明說要再審才加 --reset-rounds，或 commit 後開新一輪`, { nextAction: "handoff", round: reserved.used, maxRounds: cfg.maxRounds, cycleKey }),
       options.json,
       renderReview
     );
@@ -602,6 +628,7 @@ async function cmdReview(argv) {
   });
   result.mode = mode;
   result.strict = strict;
+  result.stage = "full";
   result.reviewRoot = roots.reviewRoot;
   result.configRoot = roots.configRoot;
   result.checks = checksResults;
@@ -615,6 +642,10 @@ async function cmdReview(argv) {
     result.findings = split.findings;
     result.lowConfidence = split.lowConfidence;
     result.confidenceThreshold = cfg.confidenceThreshold;
+    // 編號（findings 在前、lowConfidence 在後）：`review --verify --fixed <編號>` 用它指出修了哪幾條
+    [...result.findings, ...result.lowConfidence].forEach((f, i) => {
+      f.index = i + 1;
+    });
     if (!strict) {
       // 校準模式：verdict 依過濾後的 findings 重算（沒有 critical/high 就 approve），否則會出現「沒有可修項目卻 needs-attention」
       result.modelVerdict = result.verdict;
@@ -627,13 +658,227 @@ async function cmdReview(argv) {
     result.round = round - 1;
     result.roundReleased = true;
   } else {
-    // 完成：解除自己的登記；approve 且沒有其他 session 進行中才清整個 cycle（沒 commit 的專案靠這條開新輪）
-    // 注意：verdict 已在上面依 confidence 過濾重算過，這裡用的是最終 verdict
-    result.cycleReset = completeRound(root, cycleKey, reserved.reservationId, { approve: result.ok && result.verdict === "approve" });
+    // 完成：解除自己的登記；這次沒留下任何要處理的 finding 且沒有其他 session 進行中才清整個 cycle（沒 commit 的專案靠這條開新輪）。
+    // 校準審查不看 verdict：verdict 只反映 critical/high，還有 medium 要修時不能把 cycle（與快照）清掉。
+    const open = result.ok && Array.isArray(result.findings) ? [...result.findings, ...(result.lowConfidence ?? [])] : null;
+    const approve = verifiable ? Boolean(open) && open.length === 0 : result.ok && result.verdict === "approve";
+    result.cycleReset = completeRound(root, cycleKey, reserved.reservationId, { approve });
+    if (verifiable && open?.length) {
+      if (snap0?.tree) {
+        saveSnapshot(root, cycleKey, { tree: snap0.tree, findings: open, stage: "full" });
+        result.snapshotTree = snap0.tree;
+        // 官方 companion 審的是活的 working tree，不是 T0：審查期間有人改檔就提醒（基準仍用 T0，只會讓下次 delta 變多，不會漏）
+        const after = gitSnapshotTree(root);
+        if (after.tree && after.tree !== snap0.tree) result.treeChangedDuringReview = true;
+      } else {
+        result.snapshotError = snap0?.error ?? "無法建立 working tree 快照";
+      }
+    }
   }
   if (userFocus && mode === "native") result.note = "native review 不支援 focus 文字，已忽略；要帶 focus 請用 --adversarial";
   if (result_note_subs) result.submodulesSkipped = result_note_subs; // 提醒：這些 submodule 內的改動沒被審，要另外 --cwd 進去審
   emit(result, options.json, renderReview);
+}
+
+// ---------- review --verify ----------
+/** 修正 delta 的大小上限：超過就不是「修 finding」的量了，該 commit 後開新一輪整份審 */
+const VERIFY_DELTA_MAX_BYTES = 200 * 1024;
+
+/** finding 的 file 正規化成「相對審查根、/ 分隔」，供與 delta 路徑比對 */
+function relFindingPath(root, file) {
+  if (typeof file !== "string" || !file.trim()) return null;
+  let f = file.trim();
+  if (path.isAbsolute(f)) f = path.relative(root, f);
+  return f.replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
+/** --fixed "1,3" → 快照 findings 裡對應的條目；省略＝全部。回 {claimed, declined} 或 {error}。 */
+function pickFixed(value, findings) {
+  if (value === undefined) return { claimed: findings, declined: [] };
+  const tokens = String(value)
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+  if (!tokens.length || tokens.some((t) => !/^\d+$/.test(t))) return { error: `--fixed 必須是逗號分隔的 finding 編號（例如 --fixed 1,3），收到：${JSON.stringify(value)}` };
+  const want = new Set(tokens.map(Number));
+  const known = new Set(findings.map((f) => f.index));
+  const unknown = [...want].filter((n) => !known.has(n));
+  if (unknown.length) return { error: `--fixed 的編號 ${unknown.join(", ")} 不在上次送審的結果裡（可用：${[...known].join(", ")}）` };
+  return { claimed: findings.filter((f) => want.has(f.index)), declined: findings.filter((f) => !want.has(f.index)) };
+}
+
+function findingLoc(f) {
+  return f.file ? `${f.file}${f.line_start ? `:${f.line_start}` : ""}` : "(no location)";
+}
+
+function buildVerifyPrompt({ claimed, declined, patch, checks }) {
+  return [
+    "You are verifying fixes to previously reported findings. This is NOT a new review. Do not modify any files.",
+    "You may read the repository (read-only) to see how the changed code is used.",
+    "",
+    "Scope: the delta below — the changes made since the previous review round. Code that the delta does not touch was reviewed in the previous round and is not under review here.",
+    "",
+    "Answer exactly two questions:",
+    '1. For each finding under CLAIMED FIXED: is the defect actually resolved? If it is not, report it and set "ref" to that finding\'s number.',
+    '2. Does the delta introduce a new defect — in the lines it changes, or in unchanged code that the delta directly breaks (for example a caller of a function it changed)? If so, report it, set "caused_by_file" to the delta file that causes it, and point "file"/"line_start" at where the failure occurs.',
+    "",
+    checksSummaryForPrompt(checks).trimEnd(),
+    "CLAIMED FIXED:",
+    ...(claimed.length ? claimed.map((f) => `#${f.index} [${f.severity}] ${f.title}\n  location: ${findingLoc(f)}\n  ${f.body}`) : ["(none)"]),
+    "",
+    "DECLINED BY THE AUTHOR as not reproducible (listed for context; not in question):",
+    ...(declined.length ? declined.map((f) => `#${f.index} ${f.title} — ${findingLoc(f)}`) : ["(none)"]),
+    "",
+    "Output ONLY a single JSON object, no markdown fences, no prose before or after, with exactly this shape:",
+    '{"verdict":"approve"|"needs-attention","summary":"one paragraph","findings":[{"severity":"critical"|"high"|"medium"|"low","title":"...","body":"concrete failure scenario: inputs/state -> wrong outcome","file":"repo-relative path","line_start":<int>,"line_end":<int>,"confidence":<0..1>,"recommendation":"...","ref":<number of the CLAIMED FIXED finding that is still unresolved, or null>,"caused_by_file":<delta file that introduces this defect, or null>}],"next_steps":["..."]}',
+    'Use "approve" with an empty findings array when every claimed fix is resolved and the delta introduces no defect.',
+    "",
+    "----- DELTA BEGIN -----",
+    patch,
+    "----- DELTA END -----"
+  ].join("\n");
+}
+
+/**
+ * 驗收修正：只送「上次送審之後才改的部分」。
+ * 順序：快照存在 → 額度預檢 → 機械檢查（可能改檔）→ 取現在的 tree 與 delta → 機密閘門 →（reviewer=claude 在此交回）→ 佔輪次 → Codex。
+ */
+async function cmdVerify({ options, userFocus, roots, cfg, checksWarnings, mode, strict }) {
+  const root = roots.reviewRoot;
+  const common = { stage: "verify", mode, reviewRoot: roots.reviewRoot, configRoot: roots.configRoot };
+  const fail = (msg, extra = {}) => emit(localError("review", msg, { ...common, ...extra }), options.json, renderReview);
+  if (strict || mode !== "adversarial") return fail("--verify 只支援預設的 adversarial 審查（--strict／native 的結果只呈現、不進驗收）");
+  if (userFocus) return fail("--verify 不收 focus 文字：只用 --fixed <編號> 指出這次修了哪幾條");
+  if (options["reset-rounds"]) return fail("--verify 不可搭配 --reset-rounds");
+  if (!gitTopLevel(root)) return fail(`${root} 不是 git repo`);
+  const retries = parseRetries(options.retries);
+  if (retries === null) return fail(`--retries 必須是 0..${MAX_RETRIES} 的整數`);
+  const claudeOnly = cfg.reviewer === "claude";
+  const cycleKey = reviewCycleKey(root, { mode, base: options.base, scope: options.scope });
+  const snap = getSnapshot(root, cycleKey);
+  if (!snap) {
+    return fail("找不到先前的整份審查（這批改動還沒審過，或已 commit／重置）；請先跑 review 整份送審。整份審若帶了 --base／--scope，--verify 也要帶相同的值", { nextAction: "full", cycleKey });
+  }
+
+  let claimed = [];
+  let declined = [];
+  if (claudeOnly) {
+    if (options.fixed !== undefined) return fail("reviewer=claude 時 --fixed 不適用：findings 在自審 subagent 的回覆裡，請直接填進 self-review.md 的 D 變體");
+  } else {
+    if (!Array.isArray(snap.findings) || snap.findings.length === 0) {
+      return fail("快照裡沒有待驗收的 findings，Codex 無從驗收；請 commit 後開新一輪，或由使用者明說後 review --reset-rounds 重新整份審", { nextAction: "handoff", cycleKey });
+    }
+    const picked = pickFixed(options.fixed, snap.findings);
+    if (picked.error) return fail(picked.error);
+    ({ claimed, declined } = picked);
+    const used = roundsUsed(root, cycleKey);
+    if (used >= cfg.maxRounds) {
+      return fail(`此批改動已送審 ${used} 次（maxRounds=${cfg.maxRounds}），不再送審；請用交還格式交使用者裁決，或 commit 後開新一輪`, { nextAction: "handoff", round: used, maxRounds: cfg.maxRounds, cycleKey });
+    }
+    const quotaEarly = await quotaFor(cfg);
+    if (quotaEarly.status === "exhausted") {
+      return emit({ ...base("review", common), reason: "quota", quota: quotaEarly, error: quotaMessage(quotaEarly), cycleKey }, options.json, renderReview);
+    }
+  }
+
+  let checksResults = [];
+  if (cfg.checks.length && !options["skip-checks"]) {
+    checksResults = runChecks(root, cfg);
+    const failed = checksResults.find((c) => !c.ok);
+    if (failed) {
+      return emit(
+        { ...localError("review", `機械檢查失敗：${failed.cmd}${failed.error ? `（${failed.error}）` : `（exit ${failed.status}）`}；先修到通過再驗收`, common), reason: "checks-failed", checks: checksResults, checksWarnings },
+        options.json,
+        renderReview
+      );
+    }
+  }
+
+  // 機械檢查跑完才取：會改檔的 check（formatter／generator）改出來的東西也算這次的 delta，快照也以檢查後為準
+  const now = gitSnapshotTree(root);
+  if (now.error) return fail(`無法建立 working tree 快照：${now.error}`);
+  const delta = gitTreeDelta(root, snap.tree, now.tree);
+  if (delta.missing) return fail("上次送審的快照已失效（git 物件已被清除）；請 commit 後開新一輪，或由使用者明說後 review --reset-rounds 重新整份審", { nextAction: "handoff", cycleKey });
+  if (delta.error) return fail(delta.error);
+  if (!delta.paths.length) return fail("上次送審之後沒有任何改動，無需驗收", { nextAction: "none", cycleKey });
+  if (delta.bytes > VERIFY_DELTA_MAX_BYTES) {
+    return fail(`修正 delta 有 ${Math.round(delta.bytes / 1024)} KB（上限 ${VERIFY_DELTA_MAX_BYTES / 1024} KB），已不是「修 finding」的量；請 commit 後開新一輪整份審`, { nextAction: "handoff", cycleKey });
+  }
+  if (!claudeOnly) {
+    // reviewer=claude 不外送，比照整份審免機密閘門
+    const gate = secretGate(delta.paths, options["allow-secrets"]);
+    if (gate) return fail(gate);
+  }
+
+  const since = snap.stage === "verify" ? "verification" : "review";
+  const target = { mode: "verify", label: `fix delta since last ${since} (${delta.paths.length} file${delta.paths.length === 1 ? "" : "s"})` };
+  const deltaInfo = { fromTree: snap.tree, toTree: now.tree, paths: delta.paths, bytes: delta.bytes };
+  if (claudeOnly) {
+    // 快照不滾動：CLI 在 subagent 開始前就返回，不知道自審有沒有成功；先滾動的話，失敗後重試只會得到空 delta
+    return emit(
+      {
+        ...base("review", { ...common, reason: "reviewer-claude", error: "reviewer=claude：Codex 已停用，請依 Skill 用 Claude 唯讀 subagent 驗收修正（self-review.md D 變體）" }),
+        reviewer: "claude",
+        target,
+        delta: deltaInfo,
+        checks: checksResults,
+        checksWarnings
+      },
+      options.json,
+      renderReview
+    );
+  }
+
+  const reserved = reserveRound(root, cycleKey, cfg.maxRounds);
+  if (!reserved.ok) {
+    return fail(`此批改動已送審 ${reserved.used} 次（maxRounds=${cfg.maxRounds}），不再送審；請用交還格式交使用者裁決，或 commit 後開新一輪`, { nextAction: "handoff", round: reserved.used, maxRounds: cfg.maxRounds, cycleKey });
+  }
+  const tmp = path.join(os.tmpdir(), `codex-dispatch-verify-${crypto.randomBytes(4).toString("hex")}.md`);
+  fs.writeFileSync(tmp, buildVerifyPrompt({ claimed, declined, patch: delta.patch, checks: checksResults }), "utf8");
+  try {
+    const result = await runWithPolicy({ kind: "review", cfg, root, build: () => ["task", "--json", "--prompt-file", tmp], interpret: interpretTask({ requireJson: true, verify: true }), retries });
+    Object.assign(result, common, { target, delta: deltaInfo, checks: checksResults, round: reserved.round, maxRounds: cfg.maxRounds, cycleKey, fixed: claimed.map((f) => f.index) });
+    if (checksWarnings.length) result.checksWarnings = checksWarnings;
+    if (options["skip-checks"] && cfg.checks.length) result.checksSkipped = true;
+    if (result.ok) {
+      // 確定性分流（不靠 prompt 自律）：範圍內＝① 指名某條宣稱已修的 finding 沒修好（位置不在 delta 也算，修正可能改在別的檔）
+      // ② 位置在 delta 檔內 ③ 由 delta 檔造成（delta 弄壞沒改動的呼叫端）。其餘只呈現。
+      const inDelta = new Set(delta.paths);
+      const claimedIdx = new Set(claimed.map((f) => f.index));
+      const inScope = [];
+      const outOfScope = [];
+      for (const f of result.findings) {
+        const hit = (f.ref !== null && claimedIdx.has(f.ref)) || inDelta.has(relFindingPath(root, f.file)) || inDelta.has(relFindingPath(root, f.caused_by_file));
+        (hit ? inScope : outOfScope).push(f);
+      }
+      inScope.forEach((f, i) => {
+        f.index = i + 1;
+      });
+      result.findings = inScope;
+      result.outOfScope = outOfScope;
+      result.modelVerdict = result.verdict;
+      result.verdict = inScope.length ? "needs-attention" : "approve";
+    }
+    if (!result.ok && (result.reason === "quota" || result.reason === "local-error")) {
+      releaseRound(root, cycleKey, reserved.reservationId);
+      result.round = reserved.round - 1;
+      result.roundReleased = true;
+    } else {
+      result.cycleReset = completeRound(root, cycleKey, reserved.reservationId, { approve: result.ok && result.findings.length === 0 });
+      // 驗收成功就把基準滾到這次送出的 tree：下一次驗收只看這之後的改動、--fixed 指這次的編號。失敗則保留舊快照，補審時重送同一段。
+      if (result.ok && !result.cycleReset) {
+        saveSnapshot(root, cycleKey, { tree: now.tree, findings: result.findings, stage: "verify" });
+        result.snapshotTree = now.tree;
+      }
+    }
+    emit(result, options.json, renderReview);
+  } finally {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 // ---------- plan-review ----------
@@ -658,7 +903,7 @@ function buildPlanPrompt(relPath, content) {
   ].join("\n");
 }
 
-function interpretTask({ requireJson }) {
+function interpretTask({ requireJson, verify = false }) {
   return (r, payload) => {
     const spawnErr = interpretSpawn(r);
     if (spawnErr) return spawnErr;
@@ -679,7 +924,7 @@ function interpretTask({ requireJson }) {
       return { ok: true, reason: null, raw, touchedFiles: payload.touchedFiles ?? [], threadId: payload.threadId ?? null };
     }
     const parsed = parseJsonLoose(raw);
-    const v = validateStructured(parsed);
+    const v = validateStructured(parsed, { verify });
     if (!v.ok) return { ok: false, reason: "invalid-output", error: v.error, raw, retryable: true };
     return { ok: true, reason: null, verdict: v.verdict, summary: v.summary, findings: v.findings, nextSteps: v.nextSteps, raw, threadId: payload.threadId ?? null };
   };
@@ -1692,7 +1937,7 @@ function renderFindings(findings) {
     .map((f) => {
       const loc = f.file ? ` — ${f.file}${f.line_start ? `:${f.line_start}${f.line_end && f.line_end !== f.line_start ? `-${f.line_end}` : ""}` : ""}` : "";
       const conf = typeof f.confidence === "number" ? ` (confidence ${f.confidence})` : "";
-      return `- [${f.severity.toUpperCase()}] ${f.title}${loc}${conf}\n  ${f.body}${f.recommendation ? `\n  → ${f.recommendation}` : ""}`;
+      return `- ${f.index ? `#${f.index} ` : ""}[${f.severity.toUpperCase()}] ${f.title}${loc}${conf}\n  ${f.body}${f.recommendation ? `\n  → ${f.recommendation}` : ""}`;
     })
     .join("\n")}\n`;
 }
@@ -1700,6 +1945,7 @@ function renderFindings(findings) {
 function renderFailure(r) {
   if (r.reason === "reviewer-claude") {
     const lines = [`○ ${r.kind}：reviewer=claude，Codex 已停用 → 改走 Claude 自審 subagent`, `  Target: ${r.target?.label ?? "?"}${r.target?.base ? `（base ${r.target.base}）` : ""}`, `  Root: ${r.reviewRoot ?? "?"}`];
+    if (r.delta) lines.push(`  Delta: git diff --no-renames ${r.delta.fromTree} ${r.delta.toTree}（${r.delta.paths.length} 檔）`);
     if (r.checks?.length) lines.push("  機械檢查：", renderChecks(r.checks));
     for (const w of r.checksWarnings ?? []) lines.push(`  ⚠ ${w}`);
     return `${lines.join("\n")}\n`;
@@ -1715,10 +1961,12 @@ function renderReview(r) {
   if (!r.ok) return renderFailure(r);
   const checksLine = r.checks?.length ? `\nGround truth:\n${renderChecks(r.checks)}` : r.checksSkipped ? "\n⚠ 機械檢查已跳過（--skip-checks）" : "";
   const warnLines = (r.checksWarnings ?? []).map((w) => `\n⚠ ${w}`).join("");
-  const head = `# Codex ${r.kind}${r.mode ? ` (${r.mode})` : ""}\nTarget: ${r.target?.label ?? "?"}${r.round ? `\nRound: ${r.round}/${r.maxRounds}` : ""}${r.quota ? `\n${quotaMessage(r.quota)}` : ""}${checksLine}${warnLines}${r.submodulesSkipped ? `\n⚠ 未審到 submodule 內的改動：${r.submodulesSkipped.join(", ")}（請 --cwd 進該 repo 另外送審）` : ""}\n`;
+  const head = `# Codex ${r.kind}${r.mode ? ` (${r.mode})` : ""}\nTarget: ${r.target?.label ?? "?"}${r.stage === "verify" ? `\nStage: verify（只驗收修正；宣稱已修 #${(r.fixed ?? []).join(", #")}）` : ""}${r.round ? `\nRound: ${r.round}/${r.maxRounds}` : ""}${r.quota ? `\n${quotaMessage(r.quota)}` : ""}${checksLine}${warnLines}${r.submodulesSkipped ? `\n⚠ 未審到 submodule 內的改動：${r.submodulesSkipped.join(", ")}（請 --cwd 進該 repo 另外送審）` : ""}\n`;
   if (r.verdict === null || r.verdict === undefined) return `${head}\n${r.raw ?? ""}\n${r.note ? `\n（${r.note}）\n` : ""}`;
-  const low = r.lowConfidence?.length ? `\n## Low confidence (< ${r.confidenceThreshold}，只供參考、不自動修)\n${renderFindings(r.lowConfidence)}` : "";
-  return `${head}${r.strict ? "Mode: strict adversarial（未校準，只跑一次）\n" : ""}\nVerdict: ${r.verdict}\n${r.summary ? `${r.summary}\n` : ""}\n## Findings\n${renderFindings(r.findings)}${low}${r.nextSteps?.length ? `\n## Next steps\n${r.nextSteps.map((s) => `- ${s}`).join("\n")}\n` : ""}`;
+  const low = r.lowConfidence?.length ? `\n## Low confidence (< ${r.confidenceThreshold})\n${renderFindings(r.lowConfidence)}` : "";
+  const oos = r.outOfScope?.length ? `\n## Out of scope（不在這次修正範圍內，只呈現、不處理）\n${renderFindings(r.outOfScope)}` : "";
+  const notes = `${r.treeChangedDuringReview ? "\n⚠ 審查期間 working tree 有變動；下次驗收的 delta 會包含那些變動\n" : ""}${r.snapshotError ? `\n⚠ 快照失敗（${r.snapshotError}）：這批改動無法 --verify\n` : ""}`;
+  return `${head}${r.strict ? "Mode: strict adversarial（未校準，只跑一次）\n" : ""}\nVerdict: ${r.verdict}\n${r.summary ? `${r.summary}\n` : ""}\n## Findings\n${renderFindings(r.findings)}${low}${oos}${notes}${r.nextSteps?.length ? `\n## Next steps\n${r.nextSteps.map((s) => `- ${s}`).join("\n")}\n` : ""}`;
 }
 
 function renderRescue(r) {

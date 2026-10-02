@@ -2,7 +2,7 @@
 
 用 `Agent` 工具開一個 **Explore**（唯讀）subagent，把對應變體整段當 prompt 送進去。subagent 有自己的 context，不會繼承你這個 session 的假設，這是它能抓到你盲點的原因——**不要**在 prompt 裡替自己辯解或先講「我覺得沒問題」。subagent 回來後跑 `git status --short` 確認它沒動任何檔案。
 
-三個變體：**A. 審 diff**、**B. 審計畫**、**C. rescue 重新診斷**。`{{TARGET}}`／`{{ROOT}}`／`{{FOCUS}}`／`{{PLAN_PATH}}`／`{{SYMPTOM}}` 等佔位符自行替換；沒有 focus 就刪掉那行。`{{TARGET}}`／`{{ROOT}}` 一律照 CLI `--json` 回的 `target.label`／`target.base`／`reviewRoot` 填，不要自己猜（`--base`／`--scope branch` 的目標是 commit 之間的 diff，working tree 可能是空的）。
+四個變體：**A. 審 diff**、**B. 審計畫**、**C. rescue 重新診斷**、**D. 驗收修正**。`{{TARGET}}`／`{{ROOT}}`／`{{FOCUS}}`／`{{PLAN_PATH}}`／`{{SYMPTOM}}` 等佔位符自行替換；沒有 focus 就刪掉那行。`{{TARGET}}`／`{{ROOT}}` 一律照 CLI `--json` 回的 `target.label`／`target.base`／`reviewRoot` 填，不要自己猜（`--base`／`--scope branch` 的目標是 commit 之間的 diff，working tree 可能是空的）。
 
 輸出格式三者共用（放在每個變體最後）：
 
@@ -63,3 +63,23 @@ Procedure:
 3. Propose the minimal fix as a description plus a unified diff in `recommendation`. Do NOT apply it.
 
 （接共用輸出格式，但語意改為：`findings[0]` = 根因（severity 依影響）；後續 findings = 其他發現；`verdict` 用 `needs-attention` 表示找到根因需修、`approve` 表示無法確認根因。）
+
+---
+
+## D. 驗收修正（`reviewer=claude` 的 `review --verify`）
+
+`{{FROM_TREE}}`／`{{TO_TREE}}`／`{{ROOT}}` 照 `review --verify --json` 回的 `delta.fromTree`／`delta.toTree`／`reviewRoot` 填；`{{FINDINGS}}` 填這次要驗收的 findings（上一次自審回的原文：編號、title、body、位置），不要改寫、不要加你的解釋。
+
+You are verifying fixes to previously reported findings. This is NOT a new review. You did NOT write this code. Do not modify any files.
+
+Root: {{ROOT}} — run every git command inside this directory
+Delta: run `git diff --no-renames {{FROM_TREE}} {{TO_TREE}}` — this is everything the author changed since the previous review round. Code the delta does not touch was reviewed in the previous round and is not under review here.
+
+CLAIMED FIXED:
+{{FINDINGS}}
+
+Answer exactly two questions:
+1. For each finding under CLAIMED FIXED: is the defect actually resolved? Re-derive it from the code (and run the relevant tests if there are any); do not take the author's word. If it is not resolved, report it and say which finding number it is.
+2. Does the delta introduce a new defect — in the lines it changes, or in unchanged code that the delta directly breaks (for example a caller of a function it changed)? If so, report it and name the delta file that causes it.
+
+（接共用輸出格式。`verdict`＝`approve` 表示每條都修好且 delta 沒有造成新缺陷。沒修好的原 finding 在 `title` 開頭標 `[unresolved #N]`；delta 造成的新缺陷在 `body` 寫明是 delta 的哪個檔、哪一行造成。回來後我自己分流：位置不在 delta 檔內、也不是上述兩類的意見＝範圍外，只列出不處理。）

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 
 export function claudeConfigDir() {
@@ -68,6 +69,72 @@ export function gitDiffPathsForGate(cwd, ref) {
     }
   }
   return out;
+}
+
+const lastLine = (r) => (r.error ? r.error.message : (r.stderr || "").trim().split(/\r?\n/).slice(-1)[0] || `exit ${r.status}`);
+
+/**
+ * working tree 快照：用臨時 index（GIT_INDEX_FILE）把目前的 working tree 寫成一個 tree 物件，回 {tree} 或 {error}。
+ * 含 untracked、尊重 .gitignore，不動使用者的 .git/index。排除 .claude/state/（本 plugin 自己的 state／鎖檔，
+ * 每次送審都會變，進了快照會讓「修正 delta」永遠多出一筆）。
+ * 臨時 index 從**真正的 index** 複製起手（不是 HEAD）：已 staged 的檔——包含 `git add -f` 進來、被 .gitignore 忽略的——
+ * 都在裡面，`git add -A` 才會跟著 working tree 更新它們；從 HEAD 起手會漏掉這些檔，之後對它們的修正進不了 delta。
+ */
+export function gitSnapshotTree(cwd) {
+  const tmp = path.join(os.tmpdir(), `codex-dispatch-index-${process.pid}-${crypto.randomBytes(6).toString("hex")}`);
+  const opts = { cwd, encoding: "utf8", windowsHide: true, timeout: 60_000, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, GIT_INDEX_FILE: tmp } };
+  try {
+    const idx = spawnSync("git", ["rev-parse", "--git-path", "index"], { cwd, encoding: "utf8", windowsHide: true });
+    const realIndex = idx.status === 0 && idx.stdout.trim() ? path.resolve(cwd, idx.stdout.trim()) : null;
+    if (realIndex && fs.existsSync(realIndex)) {
+      fs.copyFileSync(realIndex, tmp);
+      // 複製來的 index 帶著 assume-unchanged／skip-worktree 旗標，git add -A 會跳過這些檔的修改 → 在臨時 index 裡清掉（不碰真正的 index）
+      const ls = spawnSync("git", ["ls-files", "-v", "-z"], opts);
+      if (ls.error || ls.status !== 0) return { error: `git ls-files（臨時 index）失敗：${lastLine(ls)}` };
+      const flagged = ls.stdout
+        .split("\0")
+        .filter((e) => e && /^[a-zS]/.test(e)) // 小寫＝assume-unchanged；S／s＝skip-worktree
+        .map((e) => e.slice(2));
+      // 兩個旗標要分兩次清：update-index 一次只處理一種標記模式，同時給只有第一個生效
+      for (const unset of flagged.length ? ["--no-assume-unchanged", "--no-skip-worktree"] : []) {
+        const clear = spawnSync("git", ["update-index", unset, "-z", "--stdin"], { ...opts, input: `${flagged.join("\0")}\0` });
+        if (clear.error || clear.status !== 0) return { error: `git update-index ${unset}（臨時 index）失敗：${lastLine(clear)}` };
+      }
+    }
+    const add = spawnSync("git", ["add", "-A"], opts);
+    if (add.error || add.status !== 0) return { error: `git add（臨時 index）失敗：${lastLine(add)}` };
+    // 事後從臨時 index 拿掉，不用 exclude pathspec：.claude/state 被 .gitignore 忽略時（實際專案的常態），在 pathspec 裡點名它會讓 git add 直接失敗
+    const rm = spawnSync("git", ["rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", ".claude/state"], opts);
+    if (rm.error || rm.status !== 0) return { error: `git rm --cached（臨時 index）失敗：${lastLine(rm)}` };
+    const wt = spawnSync("git", ["write-tree"], opts);
+    if (wt.error || wt.status !== 0 || !wt.stdout.trim()) return { error: `git write-tree 失敗：${lastLine(wt)}` };
+    return { tree: wt.stdout.trim() };
+  } finally {
+    for (const f of [tmp, `${tmp}.lock`]) {
+      try {
+        fs.unlinkSync(f);
+      } catch {
+        /* 不存在 */
+      }
+    }
+  }
+}
+
+/**
+ * 兩個 tree 之間的 diff（驗收用的「修正 delta」）。回 {paths, patch, bytes}、{missing:true}（fromTree 已被 gc）或 {error}。
+ * patch 與路徑清單都關掉 rename 偵測：`.env -> config.txt` 會呈現為「刪 .env＋新增 config.txt」，
+ * 兩端路徑都進機密閘門（與 gitDiffPathsForGate 收 rename 兩端同一個目的）。
+ */
+export function gitTreeDelta(cwd, fromTree, toTree) {
+  const opts = { cwd, encoding: "utf8", windowsHide: true, timeout: 60_000, maxBuffer: 64 * 1024 * 1024 };
+  for (const t of [fromTree, toTree]) {
+    if (spawnSync("git", ["cat-file", "-e", `${t}^{tree}`], opts).status !== 0) return { missing: true };
+  }
+  const names = spawnSync("git", ["diff", "--no-renames", "--name-only", "-z", fromTree, toTree], opts);
+  if (names.error || names.status !== 0) return { error: `git diff --name-only 失敗：${lastLine(names)}` };
+  const patch = spawnSync("git", ["diff", "--no-renames", "--no-color", "--no-ext-diff", fromTree, toTree], opts);
+  if (patch.error || patch.status !== 0) return { error: `git diff 失敗：${lastLine(patch)}` };
+  return { paths: names.stdout.split("\0").filter(Boolean), patch: patch.stdout, bytes: Buffer.byteLength(patch.stdout, "utf8") };
 }
 
 /**
